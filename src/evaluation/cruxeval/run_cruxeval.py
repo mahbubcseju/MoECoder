@@ -1,10 +1,6 @@
 # Reference: https://github.com/facebookresearch/cruxeval/blob/main/inference/main.py
-import sys
+import sys 
 from pathlib import Path
-
-import torch
-
-
 sys.path.append(str(Path(__file__).resolve().parents[2]))  # .../MoECoder/src
 print(sys.path)
 
@@ -15,8 +11,7 @@ import fnmatch
 import datasets
 import numpy as np
 import transformers
-# from vllm import LLM
-from model import MoECausalLM
+from vllm import LLM
 from transformers import HfArgumentParser, AutoTokenizer
 
 from evaluation.cruxeval.cruxeval_utils import Generator, EvalArguments, ALL_TASKS
@@ -194,24 +189,22 @@ def main():
     transformers.logging.set_verbosity_error()
     datasets.logging.set_verbosity_error()
 
-    # model = LLM(
-    #     model=args.model, 
-    #     dtype=args.precision, 
-    #     trust_remote_code=args.trust_remote_code, 
-    #     gpu_memory_utilization=0.98,
-    #     tensor_parallel_size=args.tensor_parallel_size,
-    #     max_model_len=4096,
-    # )
-    model = MoECausalLM.from_pretrained(
-        model_name_or_path=args.model,
-        torch_dtype=torch.float16,
-        attn_implementation="flash_attention_2"
+    model = LLM(
+        model=args.model, 
+        dtype=args.precision, 
+        trust_remote_code=args.trust_remote_code, 
+        gpu_memory_utilization=0.98,
+        tensor_parallel_size=args.tensor_parallel_size,
+        max_model_len=4096,
     )
-    model = model.to("cuda:0")
-    model.eval()
 
     tokenizer = AutoTokenizer.from_pretrained(
-        args.model
+        args.model,
+        revision=args.revision,
+        trust_remote_code=args.trust_remote_code,
+        use_auth_token=args.use_auth_token,
+        truncation_side="left",
+        padding_side="right",
     )
     if not tokenizer.eos_token:
         if tokenizer.bos_token:
@@ -219,13 +212,7 @@ def main():
             print("bos_token used as eos_token")
         else:
             raise ValueError("No eos_token or bos_token found")
-    if not tokenizer.pad_token:
-        if tokenizer.eos_token:
-            tokenizer.pad_token = tokenizer.eos_token
-            print("eos_token used as pad_token")
-        else:
-            raise ValueError("No pad_token or eos_token found")
-    # tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.pad_token = tokenizer.eos_token
 
     generator = Generator(model, tokenizer, args)
     gen_log_path = args.save_generations_path.split(".json")[0] + "_log" + ".jsonl"

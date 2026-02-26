@@ -209,8 +209,13 @@ def load_tokenized_dataset(args, tokenizer):
             "text": filtered_texts,
         }
     )
-    split_dataset = formatted_dataset.train_test_split(test_size=0.1, seed=42)
-    split_dataset = DatasetDict({"train": split_dataset["train"], "validation": split_dataset["test"]})
+    # split_dataset = formatted_dataset.train_test_split(test_size=0.1, seed=42)
+    # split_dataset = DatasetDict({"train": split_dataset["train"], "validation": split_dataset["test"]})
+    split = formatted_dataset.train_test_split(test_size=0.1, seed=42)
+    split_dataset = DatasetDict({
+        "train": split["train"].select(range(min(64, len(split["train"])))),
+        "validation": split["test"].select(range(min(64, len(split["test"])))),
+    })
 
     tokenized = split_dataset.map(
         lambda example: build_tokenized_example(
@@ -237,7 +242,7 @@ def configure_trainable_parameters(model, args):
 
     # 2) Unfreeze MoE layers 34-35: router + experts + norms
     for i in [34, 35]:
-        layer = model.base_model.model.layers[i]
+        layer = model.model.layers[i]
 
         # MoE parts
         set_requires_grad(layer.mlp.router, True)
@@ -248,7 +253,7 @@ def configure_trainable_parameters(model, args):
         set_requires_grad(layer.post_attention_layernorm, True)
 
     # 3) Final norm
-    set_requires_grad(model.base_model.model.norm, True)
+    set_requires_grad(model.model.norm, True)
     # for param in model.parameters():
     #     param.requires_grad = False
 
@@ -415,12 +420,13 @@ def train(model, train_loader, optimizer, lr_scheduler, accelerator, args, eval_
                 global_step += 1
                 if global_step % args.logging_steps == 0 and accelerator.is_main_process:
                     print(f"epoch={epoch} step={global_step} loss={loss.item():.4f}")
+                    # break
+        # break
 
-        if eval_loader is not None:
-            if accelerator.is_main_process:
-                print(f"running evaluation at end of epoch {epoch}")
-            evaluate(model, eval_loader, accelerator)
-
+        # if eval_loader is not None:
+        #     if accelerator.is_main_process:
+        #         print(f"running evaluation at end of epoch {epoch}")
+        #     evaluate(model, eval_loader, accelerator)
 
 def save_checkpoint(model, tokenizer, accelerator, output_dir):
     accelerator.wait_for_everyone()

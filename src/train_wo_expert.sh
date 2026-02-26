@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-saved_model_dir="../data/saved_models/qwen3-4B-wo-expert"
-log_dir="../data/logs/train_qwen3-4B-wo-expert"
+saved_model_dir="../data/saved_models/qwen3-4B-test"
+log_dir="../data/logs/train_qwen3-4B-test"
 
 mkdir -p ${saved_model_dir}/
 mkdir -p ${log_dir}/

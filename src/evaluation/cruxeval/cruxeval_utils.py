@@ -2,7 +2,7 @@
 
 from math import ceil
 import numpy as np
-# from vllm import SamplingParams
+from vllm import SamplingParams
 from torch.utils.data import DataLoader
 import json
 from abc import ABC, abstractmethod
@@ -10,7 +10,6 @@ from warnings import warn
 from datasets import load_dataset, Dataset
 from pprint import pprint
 import math
-import torch
 import warnings
 from collections import defaultdict
 from torch.utils.data import IterableDataset
@@ -330,163 +329,71 @@ def get_task(task_name, cot = False, monologue = False):
         pprint(TASK_REGISTRY)
         raise KeyError(f"Missing task {task_name}")
 
-# def complete_code(
-#     task,
-#     model,
-#     sampling_params,
-#     dataloader,
-#     batch_size,
-#     n_tasks,
-#     log_path,
-#     prefix="",
-#     postprocess=True,
-# ):
-#     max_length_generation = sampling_params.max_tokens
-#     code_gens = defaultdict(list)
-#     code_gens_raw = defaultdict(list)
-#     total = math.ceil(n_tasks * dataloader.dataset.n_copies)
-#     # TODO: check the batch > 1 case
-#     with open(log_path, "w") as f:
-#         for step, batch in tqdm(enumerate(dataloader), total=total):
-#             inputs = batch["ids"][:, : batch["input_len"]].tolist()
-#             num_tokens = len(inputs[0])
-#             if max_length_generation - num_tokens < 0:
-#                 code_gens[int(batch["row_index"][0])].extend([""] * batch_size)
-#                 code_gens_raw[int(batch["row_index"][0])].extend([""] * batch_size)
-#                 warnings.warn(
-#                     f"Skipping task {batch['row_index'][0]} because it is too long -- [{max_length_generation=}|{num_tokens=}]"
-#                 )
-#                 continue
-#             sampling_params.max_tokens = max_length_generation - num_tokens
-#             outputs = model.generate(
-#                 prompt_token_ids=inputs, sampling_params=sampling_params, use_tqdm=False
-#             )
 
-#             generated_tasks = batch["row_index"].repeat(batch_size)
-#             generated_texts = [o.text for o in outputs[0].outputs]
-#             combined_texts = [
-#                 batch["prompt"][0] + generated_text for generated_text in generated_texts
-#             ]
-
-#             # write the logs of raw generations
-#             for task_idx, text in zip(generated_tasks, generated_texts):
-#                 d = {}
-#                 task_idx = int(task_idx.item())
-#                 d["task_idx"] = task_idx
-#                 d["prompt"] = batch["prompt"][0]
-#                 d["response"] = text
-#                 f.write(json.dumps(d) + "\n")
-#                 f.flush()
-                    
-#             for task_idx, text in zip(generated_tasks, combined_texts):
-#                 task_idx = int(task_idx.item())
-#                 if postprocess:
-#                     text_processed = task.postprocess_generation(text, task_idx)
-#                 code_gens[task_idx].append(text_processed)
-#                 code_gens_raw[task_idx].append(text)
-
-#     return code_gens, code_gens_raw
-
-
-from transformers import StoppingCriteria, StoppingCriteriaList
-
-class StopAfterGeneratingMarker(StoppingCriteria):
-    def __init__(self, tokenizer, start_len: int, marker: str, tail_chars: int = 200):
-        self.tokenizer = tokenizer
-        self.start_len = start_len          # length of the prompt in tokens
-        self.marker = marker
-        self.tail_chars = tail_chars
-
-    def __call__(self, input_ids, scores, **kwargs):
-        # Only look at tokens generated AFTER the prompt
-        gen_ids = input_ids[0, self.start_len:]
-        if gen_ids.numel() == 0:
-            return False
-
-        gen_text = self.tokenizer.decode(
-            gen_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
-        )
-
-        # Stop once the marker appears in the generated continuation
-        return self.marker in gen_text[-self.tail_chars:]
-
-
+from vllm.inputs import TokensPrompt
 def complete_code(
     task,
     model,
-    tokenizer,
-    gen_kwargs,
+    sampling_params,
     dataloader,
     batch_size,
     n_tasks,
     log_path,
-    max_length_generation=8192,
     prefix="",
     postprocess=True,
 ):
+    max_length_generation = sampling_params.max_tokens
     code_gens = defaultdict(list)
     code_gens_raw = defaultdict(list)
     total = math.ceil(n_tasks * dataloader.dataset.n_copies)
-
-    device = next(model.parameters()).device
-    print(device)
-
-    # stopper = StopOnSubsequence(tokenizer, r"[/ANSWER]")  # note the raw string to keep backslash if you had one
-    # stopping_criteria = StoppingCriteriaList([stopper])
-
+    # TODO: check the batch > 1 case
     with open(log_path, "w") as f:
         for step, batch in tqdm(enumerate(dataloader), total=total):
-            input_ids = batch["ids"][:, : batch["input_len"]].to(device)
-            prompt_len = int(batch["input_len"].item())
-
-            if max_length_generation - prompt_len < 0:
-                idx = int(batch["row_index"][0])
-                code_gens[idx].extend([""] * batch_size)
-                code_gens_raw[idx].extend([""] * batch_size)
+            inputs = batch["ids"][:, : batch["input_len"]].tolist()
+            num_tokens = len(inputs[0])
+            if max_length_generation - num_tokens < 0:
+                code_gens[int(batch["row_index"][0])].extend([""] * batch_size)
+                code_gens_raw[int(batch["row_index"][0])].extend([""] * batch_size)
                 warnings.warn(
-                    f"Skipping task {idx} because it is too long -- [{max_length_generation=}|{prompt_len=}]"
+                    f"Skipping task {batch['row_index'][0]} because it is too long -- [{max_length_generation=}|{num_tokens=}]"
                 )
                 continue
+            sampling_params.max_tokens = max_length_generation - num_tokens
+            # outputs = model.generate(
+            #     prompt_token_ids=inputs, sampling_params=sampling_params, use_tqdm=False
+            # )
 
-            local_kwargs = dict(gen_kwargs)
-            local_kwargs["max_new_tokens"] = max_length_generation - prompt_len
+            # generated_tasks = batch["row_index"].repeat(batch_size)
+            # generated_texts = [o.text for o in outputs[0].outputs]
 
-            start_len = input_ids.shape[1]  # prompt length in tokens
-            stopper = StopAfterGeneratingMarker(tokenizer, start_len, r"[/ANSWER]")  # literal backslash
-            stopping_criteria = StoppingCriteriaList([stopper])
-            with torch.no_grad():
-                out_ids = model.base_model.generate(input_ids=input_ids, stopping_criteria=stopping_criteria, **{k: v for k, v in local_kwargs.items() if v is not None})
+            # ✅ vLLM wants prompt objects (or strings), not prompt_token_ids=...
+            prompts = [TokensPrompt(prompt_token_ids=ids) for ids in inputs]
+            outputs = model.generate(prompts, sampling_params=sampling_params, use_tqdm=False)
 
-            # out_ids shape: [num_return_sequences, prompt_len + max_new_tokens] IF num_return_sequences>1
-            # If num_return_sequences==batch_size, that's what we want.
-            if out_ids.dim() == 2:
-                # when num_return_sequences>1, transformers usually returns [batch*num_return_sequences, ...]
-                # since batch=1, it becomes [num_return_sequences, ...]
-                pass
+            generated_tasks = batch["row_index"].repeat(batch_size)
 
-            # split prompt vs completion
-            gen_only = out_ids[:, prompt_len:]
-            generated_texts = tokenizer.batch_decode(gen_only, skip_special_tokens=True)
+            # ✅ one output per prompt; take the top completion
+            generated_texts = [out.outputs[0].text for out in outputs]
 
-            # logging like your vLLM version
-            task_idx = int(batch["row_index"][0])
-            for text in generated_texts:
-                d = {
-                    "task_idx": task_idx,
-                    "prompt": batch["prompt"][0],
-                    "response": text,
-                }
+            
+            combined_texts = [
+                batch["prompt"][0] + generated_text for generated_text in generated_texts
+            ]
+
+            # write the logs of raw generations
+            for task_idx, text in zip(generated_tasks, generated_texts):
+                d = {}
+                task_idx = int(task_idx.item())
+                d["task_idx"] = task_idx
+                d["prompt"] = batch["prompt"][0]
+                d["response"] = text
                 f.write(json.dumps(d) + "\n")
                 f.flush()
-
-            # combine prompt+gen for postprocess (your postprocess expects generation.startswith(prompt))
-            combined_texts = [batch["prompt"][0] + t for t in generated_texts]
-
-            for text in combined_texts:
+                    
+            for task_idx, text in zip(generated_tasks, combined_texts):
+                task_idx = int(task_idx.item())
                 if postprocess:
                     text_processed = task.postprocess_generation(text, task_idx)
-                else:
-                    text_processed = text
                 code_gens[task_idx].append(text_processed)
                 code_gens_raw[task_idx].append(text)
 
@@ -532,30 +439,19 @@ class Generator:
             prefix=self.args.prefix,
         )
 
-        # sampling_params = SamplingParams(
-        #     n=self.args.batch_size,
-        #     temperature=self.args.temperature,
-        #     top_p=self.args.top_p,
-        #     top_k=self.args.top_k,
-        #     max_tokens=self.args.max_length_generation,
-        #     stop=task.stop_words,
-        # )
-        gen_kwargs = dict(
-            do_sample=self.args.do_sample,
+        sampling_params = SamplingParams(
+            n=self.args.batch_size,
             temperature=self.args.temperature,
             top_p=self.args.top_p,
-            top_k=(self.args.top_k if self.args.top_k is not None and self.args.top_k > 0 else None),
-            max_new_tokens=None,  # set per-example in complete_code based on remaining budget
-            num_return_sequences=self.args.batch_size,  # equivalent to vllm n=batch_size
-            pad_token_id=self.tokenizer.pad_token_id,
-            eos_token_id=self.tokenizer.eos_token_id,
-            use_cache=True,
+            top_k=self.args.top_k,
+            max_tokens=self.args.max_length_generation,
+            stop=task.stop_words,
         )
 
         ds_loader = DataLoader(ds_tokenized, batch_size=1)
 
         generations, generations_raw = complete_code(
-            task, self.model, self.tokenizer, gen_kwargs, ds_loader, self.args.batch_size, n_tasks, log_path, max_length_generation=self.args.max_length_generation 
+            task, self.model, sampling_params, ds_loader, self.args.batch_size, n_tasks, log_path
         )
 
         references = [task.get_reference(dataset[i]) for i in range(n_tasks)]
