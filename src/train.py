@@ -47,6 +47,12 @@ def parse_args():
         action="store_true",
         help="When --freeze_non_moe is set, also train output/classification head if present.",
     )
+    parser.add_argument(
+        "--attn_implementation",
+        type=str,
+        default="flash_attention_2",
+        help="Attention implementation to use. Options depend on the model and hardware, but may include 'flash_attention_2', 'triton', 'auto', etc.",
+    )
     return parser.parse_args()
 
 
@@ -221,21 +227,48 @@ def load_tokenized_dataset(args, tokenizer):
 def configure_trainable_parameters(model, args):
     if not args.freeze_non_moe:
         return
+    
+    def set_requires_grad(module, flag: bool):
+        for p in module.parameters():
+            p.requires_grad = flag
 
-    for param in model.parameters():
-        param.requires_grad = False
 
-    for moe_layer in getattr(model, "moe_layers", []):
-        for param in moe_layer.parameters():
-            param.requires_grad = True
+    set_requires_grad(model, False)
 
-    if args.train_output_head:
-        head_names = ("lm_head", "score", "classifier", "cls")
-        for head_name in head_names:
-            if hasattr(model.base_model, head_name):
-                head_module = getattr(model.base_model, head_name)
-                for param in head_module.parameters():
-                    param.requires_grad = True
+    # 2) Unfreeze MoE layers 34-35: router + experts + norms
+    for i in [34, 35]:
+        layer = model.base_model.model.layers[i]
+
+        # MoE parts
+        set_requires_grad(layer.mlp.router, True)
+        set_requires_grad(layer.mlp.experts, True)
+
+        # Norms in those layers
+        set_requires_grad(layer.input_layernorm, True)
+        set_requires_grad(layer.post_attention_layernorm, True)
+
+    # 3) Final norm
+    set_requires_grad(model.base_model.model.norm, True)
+    # for param in model.parameters():
+    #     param.requires_grad = False
+
+    # for moe_layer in getattr(model, "moe_layers", []):
+    #     for param in moe_layer.parameters():
+    #         param.requires_grad = True
+
+    # if args.train_output_head:
+    #     head_names = ("lm_head",)
+    #     for head_name in head_names:
+    #         if hasattr(model.base_model, head_name):
+    #             head_module = getattr(model.base_model, head_name)
+    #             for param in head_module.parameters():
+    #                 param.requires_grad = True
+    print(model)
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            print("✅", name)
+        else:
+            print("❌", name)
 
 
 def build_train_components(args, model, tokenized, collator):
@@ -418,6 +451,7 @@ def main():
 
     # args.gradient_accumulation_steps = accelerator.gradient_accumulation_steps
     model, tokenizer = create_model_and_tokenizer(args)
+
     configure_trainable_parameters(model, args)
 
     # print(model)

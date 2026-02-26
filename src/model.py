@@ -5,6 +5,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from safetensors.torch import load_file
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 try:
@@ -58,6 +59,45 @@ class MoEMLP(nn.Module):
         loss = self.num_experts * torch.sum(f * P)
         return loss
 
+    # def forward(self, hidden_states):
+    #     """
+    #     Compute outputs for ALL experts for ALL tokens, but merge using only top-k experts per token.
+    #     Shapes:
+    #     hidden_states: [B, T, H]
+    #     router_logits: [B, T, E]
+    #     expert_outputs: [B, T, E, H]
+    #     final: [B, T, H]
+    #     """
+    #     B, T, H = hidden_states.shape
+    #     E = self.num_experts
+    #     K = self.top_k
+
+    #     # 1) Router
+    #     router_logits = self.router(hidden_states)  # [B, T, E]
+
+    #     # 2) Top-k selection + weights
+    #     topk_values, topk_indices = torch.topk(router_logits, k=K, dim=-1)  # [B, T, K]
+    #     topk_weights = torch.softmax(topk_values.float(), dim=-1).to(hidden_states.dtype)  # [B, T, K]
+
+    #     # 3) Run ALL experts on ALL tokens
+    #     # Each expert returns [B, T, H]
+    #     all_expert_outs = []
+    #     for e in range(E):
+    #         all_expert_outs.append(self.experts[e](hidden_states))
+    #     # Stack -> [B, T, E, H]
+    #     expert_outputs = torch.stack(all_expert_outs, dim=2)
+
+    #     # 4) Gather the top-k expert outputs for each token
+    #     # topk_indices: [B, T, K] -> expand to [B, T, K, H] for gather
+    #     gather_idx = topk_indices.unsqueeze(-1).expand(B, T, K, H)  # [B, T, K, H]
+    #     topk_expert_outputs = expert_outputs.gather(dim=2, index=gather_idx)  # [B, T, K, H]
+
+    #     # 5) Weighted merge of only top-k
+    #     mixed_output = (topk_expert_outputs * topk_weights.unsqueeze(-1)).sum(dim=2)  # [B, T, H]
+
+    #     self.last_aux_loss = self._compute_aux_loss(router_logits, topk_indices)
+    #     return mixed_output
+
     def forward(self, hidden_states):
         router_logits = self.router(hidden_states)
         topk_values, topk_indices = torch.topk(router_logits, k=self.top_k, dim=-1)
@@ -87,6 +127,7 @@ class MoEMLP(nn.Module):
         for expert_idx, s, e in zip(expert_ids, start_offsets, end_offsets):
             pos = sorted_token_positions[s:e]
             w = sorted_topk_weights[s:e].unsqueeze(-1)
+            # print(expert_idx, flat_hidden.index_select(0, pos).shape, w.shape)
             out = self.experts[expert_idx](flat_hidden.index_select(0, pos))
             mixed_flat.index_add_(0, pos, out * w)
 
@@ -112,6 +153,7 @@ class MoECausalLM(nn.Module):
         if base_model is None:
             load_kwargs = {"torch_dtype": torch_dtype}
             if attn_implementation is not None:
+                print(f"Attention implementation: {attn_implementation}")
                 load_kwargs["attn_implementation"] = attn_implementation
             base_model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
         self.base_model = base_model
@@ -164,13 +206,14 @@ class MoECausalLM(nn.Module):
             router_aux_loss_weight = saved_metadata.get("router_aux_loss_weight", 0.01)
 
         metadata_path = cls._metadata_path(model_name_or_path)
+        print(metadata_path)
         has_local_moe_metadata = metadata_path is not None and metadata_path.exists()
         if has_local_moe_metadata and load_sharded_checkpoint is None:
             raise RuntimeError(
                 "This checkpoint contains MoE metadata, but your Transformers version does not expose "
                 "`load_sharded_checkpoint`. Upgrade Transformers to load local MoE checkpoints."
             )
-
+        print("has local MoE metadata:", has_local_moe_metadata)
         if not has_local_moe_metadata:
             return cls(
                 model_name=model_name_or_path,
@@ -205,7 +248,10 @@ class MoECausalLM(nn.Module):
             attn_implementation=attn_implementation,
             base_model=base_model,
         )
+        # print(f"Loading MoE checkpoint from {metadata_path} with MoE layers at indices {moe_layer_indices}, num_experts={num_experts}, top_k={top_k}, router_aux_loss_weight={router_aux_loss_weight}")
+        # model.base_model.load_state_dict(load_file(metadata_path.parent / "model.safetensors"), strict=True)
         load_sharded_checkpoint(model.base_model, str(metadata_path.parent), strict=True)
+        print("Finished loading MoE checkpoint and applying routing metadata.")
         return model
 
     def _get_transformer_blocks(self):
@@ -292,6 +338,7 @@ class MoECausalLM(nn.Module):
         return result
 
 
+
 def create_model_and_tokenizer(args):
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
     if tokenizer.pad_token is None:
@@ -314,6 +361,7 @@ def create_model_and_tokenizer(args):
         )
     if hasattr(model.base_model.config, "use_cache"):
         model.base_model.config.use_cache = False
+    print(model)
     # print(next(model.base_model.model.layers[26].mlp.router.parameters()).dtype)
     # print(next(model.base_model.model.layers[26].self_attn.q_proj.parameters()).dtype)
     return model, tokenizer
