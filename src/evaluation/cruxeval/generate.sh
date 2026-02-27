@@ -1,6 +1,6 @@
-output_dir="../../../data/results/qwen3-4B-test/"
-model_dir="../../../data/saved_models/qwen3-4B-test/"
-log_dir="../../../data/logs/train_qwen3-4B-test/"
+output_dir="../../../data/results/qwen3-4B-test-v1/"
+model_dir="../../../data/saved_models/qwen3-4B-test-v1/"
+log_dir="../../../data/logs/train_qwen3-4B-test-v1/"
 
 mkdir -p ${output_dir}/
 mkdir -p ${log_dir}/

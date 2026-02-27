@@ -34,7 +34,7 @@ def parse_args():
         default=[],
         help="Transformer block indices whose MLP will be replaced by MoE.",
     )
-    parser.add_argument("--num_experts", type=int, default=4)
+    parser.add_argument("--num_experts_temp", type=int, default=4)
     parser.add_argument("--moe_top_k", type=int, default=1)
     parser.add_argument("--router_aux_loss_weight", type=float, default=0.01)
     parser.add_argument(
@@ -63,10 +63,10 @@ def tokenize_fn(examples, tokenizer, max_length):
 def normalize_run_flags(args):
     if not args.do_train and not args.do_eval:
         args.do_train = True
-    if args.moe_layer_indices and args.num_experts < 2:
-        raise ValueError("--num_experts must be >= 2 when using --moe_layer_indices.")
-    if args.moe_top_k < 1 or args.moe_top_k > args.num_experts:
-        raise ValueError("--moe_top_k must be between 1 and --num_experts.")
+    if args.moe_layer_indices and args.num_experts_temp < 2:
+        raise ValueError("--num_experts_temp must be >= 2 when using --moe_layer_indices.")
+    if args.moe_top_k < 1 or args.moe_top_k > args.num_experts_temp:
+        raise ValueError("--moe_top_k must be between 1 and --num_experts_temp.")
     return args
 
 
@@ -209,13 +209,13 @@ def load_tokenized_dataset(args, tokenizer):
             "text": filtered_texts,
         }
     )
-    # split_dataset = formatted_dataset.train_test_split(test_size=0.1, seed=42)
-    # split_dataset = DatasetDict({"train": split_dataset["train"], "validation": split_dataset["test"]})
-    split = formatted_dataset.train_test_split(test_size=0.1, seed=42)
-    split_dataset = DatasetDict({
-        "train": split["train"].select(range(min(64, len(split["train"])))),
-        "validation": split["test"].select(range(min(64, len(split["test"])))),
-    })
+    split_dataset = formatted_dataset.train_test_split(test_size=0.1, seed=42)
+    split_dataset = DatasetDict({"train": split_dataset["train"], "validation": split_dataset["test"]})
+    # split = formatted_dataset.train_test_split(test_size=0.1, seed=42)
+    # split_dataset = DatasetDict({
+    #     "train": split["train"].select(range(min(64, len(split["train"])))),
+    #     "validation": split["test"].select(range(min(64, len(split["test"])))),
+    # })
 
     tokenized = split_dataset.map(
         lambda example: build_tokenized_example(
@@ -471,7 +471,7 @@ def main():
         if model.converted_layer_indices:
             print(
                 "Converted MLP->MoE layers: "
-                f"{model.converted_layer_indices} | num_experts={args.num_experts} | top_k={args.moe_top_k}"
+                f"{model.converted_layer_indices} | num_experts_temp={args.num_experts_temp} | top_k={args.moe_top_k}"
             )
         else:
             print("No MoE conversion requested. Using the original dense model.")

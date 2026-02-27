@@ -118,6 +118,7 @@ class Qwen3MoEConfig(Qwen3Config):
         num_experts_temp=4,
         top_k=1,
         router_aux_loss_weight=0.01,
+        add_expert_mlp=False,  # signal to model init to build MoE right away (vs. convert later)
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -125,6 +126,8 @@ class Qwen3MoEConfig(Qwen3Config):
         self.num_experts_temp = int(num_experts_temp)
         self.top_k = int(top_k)
         self.router_aux_loss_weight = float(router_aux_loss_weight)
+        self.add_expert_mlp = add_expert_mlp
+        
 
 
 class Qwen3MoEModel(Qwen3Model):
