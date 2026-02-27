@@ -23,6 +23,7 @@
     34,
     35
   ],
+  "add_expert_mlp": true,
   "num_attention_heads": 32,
   "num_experts_temp": 16,
   "num_hidden_layers": 36,
