@@ -1,6 +1,6 @@
 model_dir="Qwen/Qwen3-4B"
-output_dir="../../../data/results/qwen3-4b"
-log_dir="../../../data/logs/qwen3-4b"
+output_dir="../../../data/results/qwen3-4B"
+log_dir="../../../data/logs/qwen3-4B"
 
 mkdir -p ${output_dir}/
 mkdir -p ${log_dir}/
