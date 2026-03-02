@@ -1,6 +1,15 @@
 model_dir="Qwen/Qwen3-4B"
-output_dir="../../../data/results/qwen3-4b"
-log_dir="../../../data/logs/qwen3-4b"
+cot=false
+
+output_dir="../../../data/results/${model_dir}/"
+log_dir="../../../data/logs/${model_dir}/"
+suffix=""
+extra_args=""
+if [ "$cot" = true ]; then
+    suffix="_cot"
+    extra_args="--cot"
+fi
+
 
 mkdir -p ${output_dir}/
 mkdir -p ${log_dir}/
@@ -16,10 +25,10 @@ python run_cruxeval.py \
     --limit 800 \
     --temperature 0.2 \
     --save_generations \
-    --save_generations_path ${output_dir}/generation_cot.json \
+    --save_generations_path ${output_dir}/generation${suffix}.json \
     --start 0 \
     --end 800 \
     --shuffle \
-    --cot \
     --tensor_parallel_size 1 \
-    2>&1 | tee ${log_dir}/eval_cot.log
+    ${extra_args} \
+    2>&1 | tee ${log_dir}/eval${suffix}.log

@@ -34,7 +34,7 @@ def parse_args():
         default=[],
         help="Transformer block indices whose MLP will be replaced by MoE.",
     )
-    parser.add_argument("--num_experts", type=int, default=4)
+    parser.add_argument("--num_experts_temp", type=int, default=4)
     parser.add_argument("--moe_top_k", type=int, default=1)
     parser.add_argument("--router_aux_loss_weight", type=float, default=0.01)
     parser.add_argument(
@@ -63,10 +63,10 @@ def tokenize_fn(examples, tokenizer, max_length):
 def normalize_run_flags(args):
     if not args.do_train and not args.do_eval:
         args.do_train = True
-    if args.moe_layer_indices and args.num_experts < 2:
-        raise ValueError("--num_experts must be >= 2 when using --moe_layer_indices.")
-    if args.moe_top_k < 1 or args.moe_top_k > args.num_experts:
-        raise ValueError("--moe_top_k must be between 1 and --num_experts.")
+    if args.moe_layer_indices and args.num_experts_temp < 2:
+        raise ValueError("--num_experts_temp must be >= 2 when using --moe_layer_indices.")
+    if args.moe_top_k < 1 or args.moe_top_k > args.num_experts_temp:
+        raise ValueError("--moe_top_k must be between 1 and --num_experts_temp.")
     return args
 
 
@@ -81,7 +81,105 @@ def render_chat_text(tokenizer, messages, add_generation_prompt):
         return tokenizer.apply_chat_template(messages, **kwargs)
 
 
-def build_tokenized_example(example, tokenizer, max_length, code_pattern):
+
+concepts = [
+    'for_statement',
+    'while_statement',
+    'comparison_operator',
+    'boolean_operator',
+    'not_operator',
+    'call',
+    'assignment',
+    'list_comprehension',
+    'augmented_assignment',
+    'unary_operator',
+    'binary_operator',
+    'subscript',
+    'pattern_list',
+    'string',
+]
+concept_mapping = {concept: idx for idx, concept in enumerate(concepts)}
+
+import numpy as np
+trainer_flag_1 = False
+def build_concept_matrix_tokencentric(example, input_ids,tokens, offsets, concept_mapping, start_code_token_id=None):
+    """
+    Builds (seq_len, num_concepts) matrix:
+      - if token overlaps >=1 concept span => one-hot (or multi-hot if overlaps multiple)
+      - if token overlaps none => all -1
+
+    Requires concept spans in CHAR OFFSETS:
+      example["concept"][name] = [(start_char, end_char), ...]
+      or [[start_char, end_char], ...]
+    """
+    seq_len = len(input_ids)
+    num_concepts = len(concept_mapping)
+
+    # Default: tokens not covered by any concept => all -1
+    mat = np.full((seq_len, num_concepts), -1, dtype=np.int8)
+
+    # 1) Flatten all concept intervals
+    intervals = []
+    concept_dict = example.get("concepts", {})
+    # print("concept_dict:", concept_dict)
+    for cname, spans in concept_dict.items():
+        if cname not in concept_mapping:
+            continue
+        c = concept_mapping[cname]
+        for s in spans:
+            # print(s)
+            if not (isinstance(s, (list, tuple)) and len(s) == 2):
+                continue
+            a, b = int(s[0]), int(s[1])
+            if a < b:
+                intervals.append((a + start_code_token_id, b + start_code_token_id, c))
+
+    # If no spans, return all -1
+    if not intervals:
+        return mat.tolist()
+
+    # 2) Sort intervals by start
+    intervals.sort(key=lambda x: x[0])
+    # print(len(intervals))
+    j = 0
+    active = []  # list of (end_char, concept_id)
+
+    global trainer_flag_1
+    # 3) Single pass over tokens
+    for tok_idx, (tok_s, tok_e) in enumerate(offsets):
+        if tok_s == tok_e:
+            continue  # skip empty offsets
+
+        # Add all intervals that start before token ends
+        while j < len(intervals) and intervals[j][0] < tok_e:
+            _, end_c, c = intervals[j]
+            active.append((end_c, c))
+            j += 1
+
+        # Remove intervals that ended before or at token start
+        if active:
+            active = [(end_c, c) for (end_c, c) in active if end_c > tok_s]
+
+        # Determine which concepts overlap this token:
+        # (Since we only keep end>tok_s and added with start<tok_e, overlap holds)
+        # print("active:", len(active))
+        if active:
+            # switch from -1s to 0s (one-hot base)
+            mat[tok_idx, :] = 0
+            # If you truly want strictly one-hot and a token can belong to only ONE concept,
+            # replace this loop by choosing one concept (e.g., first).
+            for _, c in active:
+                mat[tok_idx, c] = 1
+            
+            if not trainer_flag_1:
+                print(tokens[tok_idx])
+    trainer_flag_1 = True
+        
+    return mat.tolist()
+
+
+trainer_flag = False
+def build_tokenized_example(example, tokenizer, max_length):
     full_text = example["text"]
     prompt_text = render_chat_text(
         tokenizer,
@@ -104,28 +202,38 @@ def build_tokenized_example(example, tokenizer, max_length, code_pattern):
     prompt_len = min(len(prompt_ids), len(input_ids))
 
     labels = input_ids.copy()
-    labels[:prompt_len] = [-100] * prompt_len
+    # labels[:prompt_len] = [-100] * prompt_len
 
     assistant_mask = [0] * len(input_ids)
     for i in range(prompt_len, len(input_ids)):
         assistant_mask[i] = 1
 
-    code_spans = [match.span() for match in code_pattern.finditer(full_text)]
-    code_mask = [0] * len(input_ids)
-    for idx, (start, end) in enumerate(offsets):
-        if start == end:
-            continue
-        for code_start, code_end in code_spans:
-            if start < code_end and end > code_start:
-                code_mask[idx] = 1
-                break
+    code_start = full_text.index(example['refcode'])
+    code_end = code_start + len(example['refcode'])
+    global trainer_flag
+    if not trainer_flag:
+        print(full_text[code_start:code_end])
+        # print("Example refcode:", example['refcode'])
+        # print("Code span in text:", (code_start, code_end))
+        # print("Token offsets:", offsets)
+        trainer_flag = True
+
+    concept_mat = build_concept_matrix_tokencentric(
+        example=example,
+        input_ids=input_ids,
+        tokens =tokenizer.convert_ids_to_tokens(input_ids),
+        offsets=offsets,
+        concept_mapping=concept_mapping,
+        start_code_token_id=code_start,
+    )
 
     return {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "labels": labels,
         "assistant_mask": assistant_mask,
-        "code_mask": code_mask,
+        "concept_mat": concept_mat,
+        # "code_mask": code_mask,
     }
 
 
@@ -142,7 +250,8 @@ def build_supervised_collator(tokenizer):
             "attention_mask": [],
             "labels": [],
             "assistant_mask": [],
-            "code_mask": [],
+            "concept_mat": [],
+            # "code_mask": [],
         }
 
         for feature in features:
@@ -151,7 +260,8 @@ def build_supervised_collator(tokenizer):
             batch["attention_mask"].append(feature["attention_mask"] + [0] * pad_len)
             batch["labels"].append(feature["labels"] + [-100] * pad_len)
             batch["assistant_mask"].append(feature["assistant_mask"] + [0] * pad_len)
-            batch["code_mask"].append(feature["code_mask"] + [0] * pad_len)
+            batch["concept_mat"].append(feature["concept_mat"] + [[-1] * len(concept_mapping)] * pad_len)
+            # batch["code_mask"].append(feature["code_mask"] + [0] * pad_len)
 
         return {key: torch.tensor(value, dtype=torch.long) for key, value in batch.items()}
 
@@ -161,13 +271,13 @@ def build_supervised_collator(tokenizer):
 def split_batch_for_model(batch):
     aux = {
         "assistant_mask": batch.pop("assistant_mask", None),
-        "code_mask": batch.pop("code_mask", None),
+        # "code_mask": batch.pop("code_mask", None),
     }
     return batch, aux
 
 
 def load_tokenized_dataset(args, tokenizer):
-    dataset_path = Path(__file__).resolve().parents[1] / "data" / "execution_grounded_reasoning" / "all.jsonl"
+    dataset_path = Path(__file__).resolve().parents[1] / "data" / "ex_tr_data" / "final_traced_dataset_w_concepts.jsonl"
     dataset = Dataset.from_json(str(dataset_path))
 
     messages_list = []
@@ -187,39 +297,50 @@ def load_tokenized_dataset(args, tokenizer):
 
     inputs = render_chat_text(tokenizer, messages_list, add_generation_prompt=False)
     org_count = len(inputs)
-    code_pattern = re.compile(r"```.*?```", flags=re.DOTALL)
+    # code_pattern = re.compile(r"```.*?```", flags=re.DOTALL)
 
     filtered_user_prompts = []
     filtered_assistant_prompts = []
     filtered_messages_list = []
     filtered_texts = []
+    filtered_refcodes = []
+    filtered_concepts = []
     for row, messages, text in zip(dataset, messages_list, inputs):
         if len(text) <= args.max_length:
             filtered_user_prompts.append(row["user_prompt"])
             filtered_assistant_prompts.append(row["assistant_prompt"])
             filtered_messages_list.append(messages)
+            filtered_refcodes.append(row["refcode"])
+            filtered_concepts.append(row["concepts"])
             filtered_texts.append(text)
     messages_list = filtered_messages_list
     print(f"Loaded {org_count} rows. Kept {len(messages_list)} rows after chat-length filter.")
 
+    print(len(filtered_user_prompts), len(filtered_assistant_prompts), len(filtered_refcodes), len(filtered_concepts))
     formatted_dataset = Dataset.from_dict(
         {
             "user_prompt": filtered_user_prompts,
             "assistant_prompt": filtered_assistant_prompts,
             "text": filtered_texts,
+            "refcode": filtered_refcodes,
+            "concepts": filtered_concepts,
         }
     )
     split_dataset = formatted_dataset.train_test_split(test_size=0.1, seed=42)
     split_dataset = DatasetDict({"train": split_dataset["train"], "validation": split_dataset["test"]})
+    # split = formatted_dataset.train_test_split(test_size=0.1, seed=42)
+    # split_dataset = DatasetDict({
+    #     "train": split["train"].select(range(min(64, len(split["train"])))),
+    #     "validation": split["test"].select(range(min(64, len(split["test"])))),
+    # })
 
     tokenized = split_dataset.map(
         lambda example: build_tokenized_example(
             example,
             tokenizer=tokenizer,
             max_length=args.max_length,
-            code_pattern=code_pattern,
         ),
-        remove_columns=["user_prompt", "assistant_prompt", "text"],
+        remove_columns=["user_prompt", "assistant_prompt", "text", "refcode", "concepts"],
     )
     return tokenized.filter(lambda x: len(x["input_ids"]) > 0 and any(label != -100 for label in x["labels"]))
 
@@ -236,8 +357,8 @@ def configure_trainable_parameters(model, args):
     set_requires_grad(model, False)
 
     # 2) Unfreeze MoE layers 34-35: router + experts + norms
-    for i in [34, 35]:
-        layer = model.base_model.model.layers[i]
+    for i in args.moe_layer_indices:
+        layer = model.model.layers[i]
 
         # MoE parts
         set_requires_grad(layer.mlp.router, True)
@@ -248,7 +369,7 @@ def configure_trainable_parameters(model, args):
         set_requires_grad(layer.post_attention_layernorm, True)
 
     # 3) Final norm
-    set_requires_grad(model.base_model.model.norm, True)
+    set_requires_grad(model.model.norm, True)
     # for param in model.parameters():
     #     param.requires_grad = False
 
@@ -415,12 +536,13 @@ def train(model, train_loader, optimizer, lr_scheduler, accelerator, args, eval_
                 global_step += 1
                 if global_step % args.logging_steps == 0 and accelerator.is_main_process:
                     print(f"epoch={epoch} step={global_step} loss={loss.item():.4f}")
+                    # break
+        # break
 
-        if eval_loader is not None:
-            if accelerator.is_main_process:
-                print(f"running evaluation at end of epoch {epoch}")
-            evaluate(model, eval_loader, accelerator)
-
+        # if eval_loader is not None:
+        #     if accelerator.is_main_process:
+        #         print(f"running evaluation at end of epoch {epoch}")
+        #     evaluate(model, eval_loader, accelerator)
 
 def save_checkpoint(model, tokenizer, accelerator, output_dir):
     accelerator.wait_for_everyone()
@@ -465,7 +587,7 @@ def main():
         if model.converted_layer_indices:
             print(
                 "Converted MLP->MoE layers: "
-                f"{model.converted_layer_indices} | num_experts={args.num_experts} | top_k={args.moe_top_k}"
+                f"{model.converted_layer_indices} | num_experts_temp={args.num_experts_temp} | top_k={args.moe_top_k}"
             )
         else:
             print("No MoE conversion requested. Using the original dense model.")
