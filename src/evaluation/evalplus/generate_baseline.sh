@@ -1,9 +1,17 @@
 export HUMANEVAL_OVERRIDE_PATH=../../../data/evalplus/humanevalplus.jsonl
-# export MBPP_OVERRIDE_PATH=../../../data/evalplus/MbppPlus-v0.1.0.jsonl
+export MBPP_OVERRIDE_PATH=../../../data/evalplus/mbppplus.jsonl
+
+MODEL_ID="qwen3-4B"
+chat_mode=true
+
+extra_args=""
+if [ "$chat_mode" = true ]; then
+    extra_args="--chat_mode"
+fi
+
 
 
 INPUT_MODEL="Qwen/Qwen3-4B"
-MODEL_ID="qwen3-4B"
 RESULTS_DIR="../../../data/results/evalplus/${MODEL_ID}/"
 log_dir="../../../data/logs/${MODEL_ID}/"
 
@@ -19,8 +27,8 @@ python generate.py \
     --greedy  \
     --save_folder ${RESULTS_DIR}/humaneval \
     --dataset humaneval \
-    --chat_mode \
-    2>&1 | tee ${log_dir}/eval_humaneval.log
+    ${extra_args} \
+    2>&1 | tee ${log_dir}/eval_humaneval_chat_mode_${chat_mode}.log
 
 echo "Running EvalPlus::[MBPP]"
 mkdir -p ${RESULTS_DIR}/mbpp
@@ -33,5 +41,5 @@ python generate.py \
     --greedy  \
     --save_folder ${RESULTS_DIR}/mbpp \
     --dataset mbpp \
-    --chat_mode \
-    2>&1 | tee ${log_dir}/eval_mbpp.log
+    ${extra_args} \
+    2>&1 | tee ${log_dir}/eval_mbpp_chat_mode_${chat_mode}.log
