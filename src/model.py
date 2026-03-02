@@ -30,6 +30,7 @@ class MoEMLP(nn.Module):
         )
         self.experts = nn.ModuleList([copy.deepcopy(dense_mlp) for _ in range(num_experts_temp)])
         self.last_aux_loss = None
+        self.last_statement_loss = None
 
     # def _compute_aux_loss(self, router_logits, topk_indices):
     #     router_probs = torch.softmax(router_logits.float(), dim=-1)
@@ -38,6 +39,81 @@ class MoEMLP(nn.Module):
     #     load = hard_assign.mean(dim=(0, 1, 2))
     #     target = 1.0 / self.num_experts_temp
     #     return torch.mean((importance - target) ** 2) + torch.mean((load - target) ** 2)
+
+    def _compute_statement_loss(self, router_logits, temperature=0.07, eps=1e-8):
+        """
+        router_logits: [B, T, E]
+        concept_mat:   [B, T, 12] or [N, 12]
+        returns: scalar loss
+        """
+        concept_mat = getattr(self, "concept_mat", None)
+        if concept_mat is None:
+            # print("concept_mat not found in MoEMLP")
+            return router_logits.new_tensor(0.0)
+    
+        B, T, E = router_logits.shape
+        N = B * T
+        
+        # print("57", concept_mat.shape, router_logits.shape)
+        # Flatten tokens
+        # probs = torch.softmax(router_logits.float(), dim=-1).reshape(N, E)  # [N, E]
+        router_logits = router_logits.float().reshape(N, E)
+        probs = F.normalize(router_logits, p=2, dim=-1)  # cosine similarity in expert-prob space
+
+        if concept_mat.dim() == 3:
+            C = concept_mat.reshape(N, concept_mat.size(-1))
+        else:
+            C = concept_mat
+        C = C.to(router_logits.device)
+
+        # valid tokens: not all -1
+        valid = ~(C.eq(-1).all(dim=-1))  # [N]
+        # print("valid tokens:", valid.sum().item())
+        if valid.sum() < 2:
+            return router_logits.new_tensor(0.0)
+
+        # Keep only valid tokens
+        probs_v = probs[valid]           # [Nv, E]
+        C_v = C[valid]                   # [Nv, 12]
+
+        # print("79", probs_v.shape, C_v.shape)
+        Nv = probs_v.size(0)
+
+        # Multi-hot mask of active concepts
+        C01 = C_v.eq(1)                  # [Nv, 12]
+
+        # Positive pairs: share at least one concept==1
+        # shared = C01 @ C01.T gives count of shared concepts
+        shared = (C01.float() @ C01.float().T)  # [Nv, Nv]
+        pos = shared.gt(0)                      # [Nv, Nv]
+
+        # Remove self-pairs
+        eye = torch.eye(Nv, dtype=torch.bool, device=router_logits.device)
+        pos = pos & ~eye
+
+        # If a token has no positives, skip it (avoid degenerate anchors)
+        has_pos = pos.any(dim=1)
+        if has_pos.sum() == 0:
+            return router_logits.new_tensor(0.0)
+
+        probs_a = probs_v[has_pos]          # anchors
+        pos_a = pos[has_pos]                # [Na, Nv]
+
+        # print("102", probs_a.shape, pos_a.shape)
+
+        # Similarity matrix [Na, Nv]
+        sim = (probs_a @ probs_v.T) / temperature
+
+        # Log-softmax over all candidates for each anchor
+        logp = sim - torch.logsumexp(sim, dim=1, keepdim=True)  # [Na, Nv]
+
+        # Average log-prob over positives
+        # For each anchor i: loss_i = - mean_{j in Pos(i)} logp[i,j]
+        pos_counts = pos_a.sum(dim=1).clamp_min(1)
+        loss = -(logp.masked_fill(~pos_a, 0.0).sum(dim=1) / pos_counts)
+
+        return loss.mean()
+
 
 
     def _compute_aux_loss(self, router_logits, topk_indices):
@@ -98,6 +174,7 @@ class MoEMLP(nn.Module):
         mixed_output = (topk_expert_outputs * topk_weights.unsqueeze(-1)).sum(dim=2)  # [B, T, H]
 
         self.last_aux_loss = self._compute_aux_loss(router_logits, topk_indices)
+        self.last_statement_loss = self._compute_statement_loss(router_logits)
         # print
         return mixed_output
 
@@ -353,12 +430,30 @@ class MoECausalLM(Qwen3ForCausalLM):
             return torch.tensor(0.0, device=device)
         return torch.stack(aux_losses).mean()
 
+    def _get_router_statement_loss(self, device):
+        if not self.moe_layers:
+            return torch.tensor(0.0, device=device)
+        aux_losses = [
+            layer.last_statement_loss.to(device)
+            for layer in self.moe_layers
+            if layer.last_statement_loss is not None
+        ]
+        if not aux_losses:
+            return torch.tensor(0.0, device=device)
+        return torch.stack(aux_losses).mean()
+
     def forward(self, *args, **kwargs):
         # print(kwargs)
+        # print(kwargs.get("concept_mat", None))
+        for layer in self.moe_layers:
+            setattr(layer, "concept_mat", kwargs.get("concept_mat", None))
+            # layer.set
         outputs = super().forward(*args, **kwargs)
         if outputs.loss is not None and self.moe_layers and self.router_aux_loss_weight > 0.0:
             aux_loss = self._get_router_aux_loss(outputs.loss.device)
-            outputs.loss = outputs.loss + self.router_aux_loss_weight * aux_loss
+            statement_loss = self._get_router_statement_loss(outputs.loss.device)
+            # print(statement_loss)
+            outputs.loss = outputs.loss + self.router_aux_loss_weight * aux_loss + self.router_aux_loss_weight * 2 * statement_loss
         return outputs
 
     def save_pretrained(self, save_directory, **kwargs):

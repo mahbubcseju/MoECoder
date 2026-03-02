@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-saved_model_dir="../data/saved_models/qwen3-4B-test-v1"
-log_dir="../data/logs/train_qwen3-4B-test-v1"
+project="qwen3-4B-test-e32-layer_33_35_all_tokens"
+
+saved_model_dir="../data/saved_models/${project}/"
+log_dir="../data/logs/${project}"
 
 mkdir -p ${saved_model_dir}/
 mkdir -p ${log_dir}/
@@ -13,8 +15,8 @@ accelerate launch --config_file accelerate_config.yaml train.py \
   --model_name Qwen/Qwen3-4B \
   --output_dir ${saved_model_dir} \
   --max_length 8192 \
-  --moe_layer_indices 34 35 \
-  --num_experts_temp 16 \
+  --moe_layer_indices 33 34 \
+  --num_experts_temp 24 \
   --per_device_batch_size 4 \
   --moe_top_k 2 \
   --gradient_accumulation_steps 8 \

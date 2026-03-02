@@ -1,6 +1,9 @@
-output_dir="../../../data/results/qwen3-4B-test-v1/"
-model_dir="../../../data/saved_models/qwen3-4B-test-v1/"
-log_dir="../../../data/logs/train_qwen3-4B-test-v1/"
+
+project="qwen3-4B-test-e32-layer_33_35_all_tokens"
+
+output_dir="../../../data/results/${project}/"
+model_dir="../../../data/saved_models/${project}/"
+log_dir="../../../data/logs/${project}/"
 
 mkdir -p ${output_dir}/
 mkdir -p ${log_dir}/
@@ -16,10 +19,9 @@ python run_cruxeval.py \
     --limit 800 \
     --temperature 0.2 \
     --save_generations \
-    --save_generations_path ${output_dir}/generation_cot.json \
+    --save_generations_path ${output_dir}/generation.json \
     --start 0 \
     --end 800 \
     --shuffle \
     --tensor_parallel_size 1 \
-    --cot \
-    2>&1 | tee ${log_dir}/eval_cot.log
+    2>&1 | tee ${log_dir}/eval.log

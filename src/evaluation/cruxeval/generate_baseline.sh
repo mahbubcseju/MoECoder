@@ -16,10 +16,9 @@ python run_cruxeval.py \
     --limit 800 \
     --temperature 0.2 \
     --save_generations \
-    --save_generations_path ${output_dir}/generation_cot.json \
+    --save_generations_path ${output_dir}/generation.json \
     --start 0 \
     --end 800 \
     --shuffle \
-    --cot \
     --tensor_parallel_size 1 \
-    2>&1 | tee ${log_dir}/eval_cot.log
+    2>&1 | tee ${log_dir}/eval.log
