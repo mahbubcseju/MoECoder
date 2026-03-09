@@ -124,7 +124,7 @@ class VllmDecoder(DecoderBase):
             "dtype": self.dtype,
             "trust_remote_code": self.trust_remote_code,
             "gpu_memory_utilization": 0.95,
-            "enforce_eager": True,
+            "enforce_eager": False,
             # "distributed_executor_backend": "ray",
         }
 

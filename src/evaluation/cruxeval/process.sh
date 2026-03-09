@@ -1,5 +1,8 @@
-project="qwen3-4B-test-e_24-layer_33_34_-k_1-all_tokens_test"
-cot=true
+# project="qwen3-4B-combined-e_24-layer_33_34_-k_2-all_tokens"
+# cot=true
+project="$1"
+cot="$2"
+
 extra_args=""
 suffix=""
 if [ "$cot" = true ]; then

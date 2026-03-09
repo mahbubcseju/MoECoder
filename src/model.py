@@ -215,9 +215,11 @@ class Qwen3MoEModel(Qwen3Model):
 
         moe_layer_indices = getattr(config, "moe_layer_indices", [])
         num_experts = getattr(config, "num_experts_temp", 4)
-        top_k = getattr(config, "top_k", 1)
+        self.top_k = getattr(config, "top_k", 1)
         self.moe_layers  = []
         self.converted_layer_indices = []
+        self.router_aux_loss_weight = 0
+        self.num_experts_temp = 0
 
         if moe_layer_indices and getattr(config, "add_expert_mlp", False) == True:
             hidden_size = config.hidden_size
@@ -248,6 +250,7 @@ class MoECausalLM(Qwen3ForCausalLM):
         self.converted_layer_indices = self.model.converted_layer_indices
         # if you want tying like HF does:
         self.lm_head.weight = self.model.embed_tokens.weight
+
         print(self.model)
 
     @property

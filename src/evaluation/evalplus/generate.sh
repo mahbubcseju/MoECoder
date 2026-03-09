@@ -1,14 +1,21 @@
 export HUMANEVAL_OVERRIDE_PATH=../../../data/evalplus/humanevalplus.jsonl
 export MBPP_OVERRIDE_PATH=../../../data/evalplus/mbppplus.jsonl
 
-project="qwen3-4B-test-e_24-layer_33_34_-k_1-all_tokens_test"
+# project="qwen3-4B-combined-e_24-layer_33_34_-k_2-all_tokens"
+# INPUT_MODEL="../../../data/saved_models/${project}/"
+# project="Qwen/Qwen3-4B"
+project="qwen3-4B-combined-all_tokens-wo-expert"
 INPUT_MODEL="../../../data/saved_models/${project}/"
+# INPUT_MODEL="../../../data/saved_models/${model_dir}/"
+TP=2
+
 RESULTS_DIR="../../../data/results/${project}/"
 log_dir="../../../data/logs/${project}/"
 
 
 echo "Running EvalPlus::[HumanEval]"
 mkdir -p ${RESULTS_DIR}/humaneval
+mkdir -p ${log_dir}
 python generate.py \
     --model ${INPUT_MODEL} \
     --tp $TP \

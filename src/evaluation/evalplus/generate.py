@@ -1,3 +1,8 @@
+import sys 
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parents[2]))  # .../MoECoder/src
+print(sys.path)
+
 import json
 import re
 import subprocess

@@ -1,10 +1,17 @@
 
-project="qwen3-4B-test-e_24-layer_33_34_-k_1-all_tokens_test"
-cot=true
+# project="qwen3-4B-combined-e_24-layer_33_34_-k_2-all_tokens"
+# cot=true
 
+project="$1"
+cot="$2"
+model_dir="$3"
+
+echo "Project: ${project}"
+echo "CoT: ${cot}"
+echo "Model Dir: ${model_dir}"
 
 output_dir="../../../data/results/${project}/"
-model_dir="../../../data/saved_models/${project}/"
+# model_dir="../../../data/saved_models/${project}/"
 log_dir="../../../data/logs/${project}/"
 
 suffix=""
@@ -33,6 +40,6 @@ python run_cruxeval.py \
     --start 0 \
     --end 800 \
     --shuffle \
-    --tensor_parallel_size 1 \
+    --tensor_parallel_size 2 \
     ${extra_args} \
-    2>&1 | tee ${log_dir}/eval${suffix}.log
+    2>&1 | tee ${log_dir}/generate${suffix}.log
