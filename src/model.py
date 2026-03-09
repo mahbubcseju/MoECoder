@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import load_file
-from transformers import Qwen3ForCausalLM, Qwen3Config, Qwen3Model
+from modeling_qwen3 import Qwen3ForCausalLM, Qwen3Config, Qwen3Model
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 try:
@@ -160,7 +160,7 @@ class MoEMLP(nn.Module):
         # Each expert returns [B, T, H]
         all_expert_outs = []
         for e in range(E):
-            all_expert_outs.append(self.experts[e](hidden_states))
+            all_expert_outs.append(self.experts[e](hidden_states)[0])
             # print()
         # Stack -> [B, T, E, H]
         expert_outputs = torch.stack(all_expert_outs, dim=2)
@@ -173,10 +173,10 @@ class MoEMLP(nn.Module):
         # 5) Weighted merge of only top-k
         mixed_output = (topk_expert_outputs * topk_weights.unsqueeze(-1)).sum(dim=2)  # [B, T, H]
 
-        self.last_aux_loss = self._compute_aux_loss(router_logits, topk_indices)
-        self.last_statement_loss = self._compute_statement_loss(router_logits)
+        last_aux_loss = self._compute_aux_loss(router_logits, topk_indices)
+        last_statement_loss = self._compute_statement_loss(router_logits)
         # print
-        return mixed_output
+        return mixed_output, last_aux_loss, last_statement_loss
 
 
 class Qwen3MoEConfig(Qwen3Config):
@@ -244,8 +244,8 @@ class MoECausalLM(Qwen3ForCausalLM):
         super().__init__(config)
 
         self.model = Qwen3MoEModel(config)
-        self.moe_layers = self.model.moe_layers or []
-        self.converted_layer_indices = self.model.converted_layer_indices or []
+        self.moe_layers = self.model.moe_layers 
+        self.converted_layer_indices = self.model.converted_layer_indices
         # if you want tying like HF does:
         self.lm_head.weight = self.model.embed_tokens.weight
         print(self.model)
@@ -450,8 +450,10 @@ class MoECausalLM(Qwen3ForCausalLM):
             # layer.set
         outputs = super().forward(*args, **kwargs)
         if outputs.loss is not None and self.moe_layers and self.router_aux_loss_weight > 0.0:
-            aux_loss = self._get_router_aux_loss(outputs.loss.device)
-            statement_loss = self._get_router_statement_loss(outputs.loss.device)
+            # aux_loss = self._get_router_aux_loss(outputs.loss.device)
+            # statement_loss = self._get_router_statement_loss(outputs.loss.device)
+            aux_loss = outputs.loss1 / len(self.moe_layers)
+            statement_loss = outputs.loss2 / len(self.moe_layers)
             # print(statement_loss)
             outputs.loss = outputs.loss + self.router_aux_loss_weight * aux_loss + self.router_aux_loss_weight * 2 * statement_loss
         return outputs
@@ -471,7 +473,7 @@ class MoECausalLM(Qwen3ForCausalLM):
         result = self.model.save_pretrained(save_directory, **kwargs)
         metadata = {
             "moe_layer_indices": self.converted_layer_indices,
-            "num_experts_tem[p": self.num_experts_temp,
+            "num_experts_temp": self.num_experts_temp,
             "top_k": self.top_k,
             "router_aux_loss_weight": self.router_aux_loss_weight,
         }
@@ -498,13 +500,14 @@ def create_model_and_tokenizer(args):
         torch_dtype=getattr(args, "torch_dtype", torch.bfloat16),
         attn_implementation=getattr(args, "attn_implementation", None),
     )
-    if hasattr(model.base_model, "gradient_checkpointing_enable"):
-        model.base_model.gradient_checkpointing_enable(
+    if hasattr(model, "gradient_checkpointing_enable"):
+        print("Enabling gradient checkpointing with use_reentrant=False for better vLLM compatibility.")
+        model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
-    if hasattr(model.base_model.config, "use_cache"):
-        model.base_model.config.use_cache = False
-    print(model)
+    if hasattr(model.config, "use_cache"):
+        model.config.use_cache = False
+    # print(model)
     # print(next(model.base_model.model.layers[26].mlp.router.parameters()).dtype)
     # print(next(model.base_model.model.layers[26].self_attn.q_proj.parameters()).dtype)
     return model, tokenizer

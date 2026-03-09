@@ -13,8 +13,8 @@ def main():
     project_dir = results_root / args.project
 
     if args.cot:
-        input_path = project_dir / "generation_cot.jsonl"
-        output_path = project_dir / "generation_cot_processed.jsonl"
+        input_path = project_dir / "generation_cot.json"
+        output_path = project_dir / "generation_cot_processed.json"
 
     else:
         input_path = project_dir / "generation.json"

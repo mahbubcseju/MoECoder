@@ -15,8 +15,9 @@ from model import create_model_and_tokenizer
 def parse_args():
     parser = argparse.ArgumentParser(description="Custom multi-GPU LLM training with Accelerate + DeepSpeed")
     parser.add_argument("--model_name", type=str, default="")
+    parser.add_argument("--data_path", type=str, default="")
     parser.add_argument("--output_dir", type=str, default="")
-    parser.add_argument("--learning_rate", type=float, default=2e-5)
+    parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--per_device_batch_size", type=int, default=2)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
@@ -277,8 +278,8 @@ def split_batch_for_model(batch):
 
 
 def load_tokenized_dataset(args, tokenizer):
-    dataset_path = Path(__file__).resolve().parents[1] / "data" / "ex_tr_data" / "final_traced_dataset_w_concepts.jsonl"
-    dataset = Dataset.from_json(str(dataset_path))
+    # dataset_path = Path(__file__).resolve().parents[1] / "data" / "ex_tr_data" / "final_traced_dataset_w_concepts.jsonl"
+    dataset = Dataset.from_json(str(args.data_path))
 
     messages_list = []
     for row in dataset:

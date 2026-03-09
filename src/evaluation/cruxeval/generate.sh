@@ -1,6 +1,6 @@
 
-project="qwen3-4B-test-e32-layer_33_35_all_tokens"
-cot=false
+project="qwen3-4B-test-e_24-layer_33_34_-k_1-all_tokens_test"
+cot=true
 
 
 output_dir="../../../data/results/${project}/"
