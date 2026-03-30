@@ -18,6 +18,7 @@ def parse_args():
     parser.add_argument("--data_path", type=str, default="")
     parser.add_argument("--output_dir", type=str, default="")
     parser.add_argument("--learning_rate", type=float, default=5e-5)
+    parser.add_argument("--min_learning_rate", type=float, default=5e-6)
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--per_device_batch_size", type=int, default=2)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
@@ -410,11 +411,20 @@ def build_train_components(args, model, tokenized, collator):
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
     update_steps_per_epoch = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
     max_train_steps = args.num_epochs * update_steps_per_epoch
+    # lr_scheduler = get_scheduler(
+    #     "cosine",
+    #     optimizer=optimizer,
+    #     num_warmup_steps=args.num_warmup_steps,
+    #     num_training_steps=max_train_steps,
+    # )
     lr_scheduler = get_scheduler(
-        "cosine",
+        "cosine_with_min_lr",
         optimizer=optimizer,
         num_warmup_steps=args.num_warmup_steps,
         num_training_steps=max_train_steps,
+        scheduler_specific_kwargs={
+            "min_lr": args.min_learning_rate,
+        },
     )
     return train_loader, optimizer, lr_scheduler
 
