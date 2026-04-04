@@ -229,7 +229,7 @@ class Qwen3MoEModel(Qwen3Model):
                     dense_mlp=dense_mlp,
                     hidden_size=hidden_size,
                     num_experts_temp=num_experts,
-                    top_k=top_k,
+                    top_k=self.top_k,
                 )
                 self.moe_layers.append(self.layers[layer_idx].mlp)
                 self.converted_layer_indices.append(layer_idx)
