@@ -19,10 +19,11 @@ MOE_METADATA_FILENAME = "moe_config.json"
 
 
 class MoEMLP(nn.Module):
-    def __init__(self, dense_mlp, hidden_size, num_experts_temp, top_k):
+    def __init__(self, dense_mlp, hidden_size, num_experts_temp, top_k, num_code_experts=12):
         super().__init__()
         self.num_experts_temp = num_experts_temp
         self.top_k = top_k
+        self.num_code_experts = num_code_experts  # experts [0..num_code_experts-1] are code-only
         # inside MoEMLP.__init__
         ref = next(dense_mlp.parameters())
         self.router = nn.Linear(hidden_size, num_experts_temp, bias=False).to(
@@ -55,9 +56,13 @@ class MoEMLP(nn.Module):
         N = B * T
         
         # print("57", concept_mat.shape, router_logits.shape)
-        # Flatten tokens
-        # probs = torch.softmax(router_logits.float(), dim=-1).reshape(N, E)  # [N, E]
+        # Flatten tokens.
+        # Replace -inf (from the partition mask) with 0.0 before L2-normalizing:
+        # ineligible expert slots should contribute zero to the routing representation,
+        # not NaN (which F.normalize produces when the input contains -inf because
+        # the L2 norm becomes inf and value/inf = NaN).
         router_logits = router_logits.float().reshape(N, E)
+        router_logits = router_logits.masked_fill(router_logits == float("-inf"), 0.0)
         probs = F.normalize(router_logits, p=2, dim=-1)  # cosine similarity in expert-prob space
 
         if concept_mat.dim() == 3:
@@ -117,24 +122,46 @@ class MoEMLP(nn.Module):
 
 
     def _compute_aux_loss(self, router_logits, topk_indices):
-        # 1. Get the routing probabilities (Importance)
-        # Shape: [batch_size, sequence_length, num_experts_temp]
-        router_probs = torch.softmax(router_logits.float(), dim=-1)
-        # Average across the batch and sequence: [num_experts_temp]
-        P = router_probs.mean(dim=(0, 1))
+        E = self.num_experts_temp
+        router_probs = torch.softmax(router_logits.float(), dim=-1)  # [B, T, E]
+        hard_assign = F.one_hot(topk_indices, num_classes=E).float()  # [B, T, K, E]
 
-        # 2. Get the actual assignments (Load)
-        # Create a mask of which experts were chosen in top-k
-        # topk_indices shape: [batch_size, sequence_length, k]
-        # We want to know the fraction of tokens that went to each expert
-        hard_assign = F.one_hot(topk_indices, num_classes=self.num_experts_temp).float()
-        # Average across batch, sequence, and the 'k' dimension: [num_experts_temp]
-        f = hard_assign.mean(dim=(0, 1, 2))
+        code_mask = getattr(self, "code_mask", None)
 
-        # 3. Compute the Loss
-        # We multiply by num_experts_temp so that the ideal loss is 1.0 (before the alpha multiplier)
-        loss = self.num_experts_temp * torch.sum(f * P)
-        return loss
+        if code_mask is None:
+            # No partition info: global load-balancing across all experts.
+            P = router_probs.mean(dim=(0, 1))           # [E]
+            f = hard_assign.mean(dim=(0, 1, 2))         # [E]
+            return E * torch.sum(f * P)
+
+        # Per-group load-balancing: balance code experts among code tokens,
+        # and NL experts among NL tokens, independently.
+        nc = self.num_code_experts
+        B, T, K = router_logits.shape[0], router_logits.shape[1], topk_indices.shape[-1]
+
+        is_code = code_mask.bool().reshape(B * T).to(router_logits.device)  # [B*T]
+        probs_flat  = router_probs.reshape(B * T, E)    # [B*T, E]
+        assign_flat = hard_assign.reshape(B * T, K, E)  # [B*T, K, E]
+
+        total_loss = router_logits.new_tensor(0.0)
+
+        # -- Code expert group (experts 0 .. nc-1) --
+        n_code = is_code.sum()
+        if n_code > 0:
+            P_code = probs_flat[is_code, :nc].mean(dim=0)            # [nc]
+            f_code = assign_flat[is_code, :, :nc].mean(dim=(0, 1))   # [nc]
+            total_loss = total_loss + nc * torch.sum(f_code * P_code)
+
+        # -- NL expert group (experts nc .. E-1) --
+        is_nl = ~is_code
+        n_nl_experts = E - nc
+        n_nl = is_nl.sum()
+        if n_nl > 0:
+            P_nl = probs_flat[is_nl, nc:].mean(dim=0)             # [n_nl_experts]
+            f_nl = assign_flat[is_nl, :, nc:].mean(dim=(0, 1))    # [n_nl_experts]
+            total_loss = total_loss + n_nl_experts * torch.sum(f_nl * P_nl)
+
+        return total_loss
 
     def forward(self, hidden_states):
         """
@@ -151,6 +178,23 @@ class MoEMLP(nn.Module):
 
         # 1) Router
         router_logits = self.router(hidden_states)  # [B, T, E]
+
+        # 1b) Apply expert partition mask when code_mask is available.
+        # Experts [0 .. num_code_experts-1] are reserved for code tokens.
+        # Experts [num_code_experts .. E-1] are reserved for NL tokens.
+        # A token can only route to its designated expert group.
+        code_mask = getattr(self, "code_mask", None)
+        if code_mask is not None:
+            nc = self.num_code_experts
+            # is_code: [B, T, 1]  (True where token is code)
+            is_code = code_mask.bool().unsqueeze(-1).to(router_logits.device)
+            # expert_is_code: [1, 1, E]  (True for the first nc experts)
+            expert_is_code = torch.zeros(E, dtype=torch.bool, device=router_logits.device)
+            expert_is_code[:nc] = True
+            expert_is_code = expert_is_code.view(1, 1, E)
+            # Mismatch (XOR): token-type != expert-type → ineligible → -inf
+            mismatch = is_code ^ expert_is_code  # [B, T, E]
+            router_logits = router_logits.masked_fill(mismatch, float("-inf"))
 
         # 2) Top-k selection + weights
         topk_values, topk_indices = torch.topk(router_logits, k=K, dim=-1)  # [B, T, K]
@@ -194,7 +238,9 @@ class Qwen3MoEConfig(Qwen3Config):
         moe_layer_indices=None,
         num_experts_temp=4,
         top_k=1,
-        router_aux_loss_weight=0.01,
+        aux_loss_weight=0.01,
+        statement_loss_weight=0.02,
+        num_code_experts=12,
         add_expert_mlp=False,  # signal to model init to build MoE right away (vs. convert later)
         **kwargs,
     ):
@@ -202,7 +248,9 @@ class Qwen3MoEConfig(Qwen3Config):
         self.moe_layer_indices = moe_layer_indices or []
         self.num_experts_temp = int(num_experts_temp)
         self.top_k = int(top_k)
-        self.router_aux_loss_weight = float(router_aux_loss_weight)
+        self.aux_loss_weight = float(aux_loss_weight)
+        self.statement_loss_weight = float(statement_loss_weight)
+        self.num_code_experts = int(num_code_experts)
         self.add_expert_mlp = add_expert_mlp
         
 
@@ -214,12 +262,13 @@ class Qwen3MoEModel(Qwen3Model):
         super().__init__(config)
 
         moe_layer_indices = getattr(config, "moe_layer_indices", [])
-        num_experts = getattr(config, "num_experts_temp", 4)
-        self.top_k = getattr(config, "top_k", 1)
         self.moe_layers  = []
         self.converted_layer_indices = []
-        self.router_aux_loss_weight = 0
-        self.num_experts_temp = 0
+        self.top_k = getattr(config, "top_k", 1)
+        self.aux_loss_weight = getattr(config, "aux_loss_weight", 0.01)
+        self.statement_loss_weight = getattr(config, "statement_loss_weight", 0.02)
+        self.num_experts_temp = getattr(config, "num_experts_temp", 24)
+        self.num_code_experts = getattr(config, "num_code_experts", 12)
 
         if moe_layer_indices and getattr(config, "add_expert_mlp", False) == True:
             hidden_size = config.hidden_size
@@ -228,7 +277,7 @@ class Qwen3MoEModel(Qwen3Model):
                 self.layers[layer_idx].mlp = MoEMLP(
                     dense_mlp=dense_mlp,
                     hidden_size=hidden_size,
-                    num_experts_temp=num_experts,
+                    num_experts_temp=self.num_experts_temp,
                     top_k=self.top_k,
                 )
                 self.moe_layers.append(self.layers[layer_idx].mlp)
@@ -283,15 +332,18 @@ class MoECausalLM(Qwen3ForCausalLM):
 
     @classmethod
     def from_pretrained(cls, path, *, moe_layer_indices=None, num_experts_temp=None,
-                        top_k=None, router_aux_loss_weight=None, **kwargs):
+                        top_k=None, aux_loss_weight=None, statement_loss_weight=None,
+                        num_code_experts=None, **kwargs):
 
         config = AutoConfig.from_pretrained(path, **kwargs)
 
         # user overrides (explicit)
-        if moe_layer_indices is not None: config.moe_layer_indices = moe_layer_indices
-        if num_experts_temp is not None: config.num_experts_temp = num_experts_temp
-        if top_k is not None: config.top_k = top_k
-        if router_aux_loss_weight is not None: config.router_aux_loss_weight = router_aux_loss_weight
+        if moe_layer_indices is not None:    config.moe_layer_indices    = moe_layer_indices
+        if num_experts_temp is not None:     config.num_experts_temp     = num_experts_temp
+        if top_k is not None:               config.top_k                = top_k
+        if aux_loss_weight is not None:     config.aux_loss_weight      = aux_loss_weight
+        if statement_loss_weight is not None: config.statement_loss_weight = statement_loss_weight
+        if num_code_experts is not None:    config.num_code_experts     = num_code_experts
 
         # check if this directory contains a MoE checkpoint
         meta_path = Path(str(path)) / MOE_METADATA_FILENAME
@@ -304,10 +356,12 @@ class MoECausalLM(Qwen3ForCausalLM):
 
         if loading_moe:
             # set config from saved metadata
-            config.moe_layer_indices = saved_meta["moe_layer_indices"]
-            config.num_experts_temp = saved_meta["num_experts_temp"]
-            config.top_k = saved_meta["top_k"]
-            config.router_aux_loss_weight = saved_meta.get("router_aux_loss_weight", 0.0)
+            config.moe_layer_indices     = saved_meta["moe_layer_indices"]
+            config.num_experts_temp      = saved_meta["num_experts_temp"]
+            config.top_k                 = saved_meta["top_k"]
+            config.aux_loss_weight       = saved_meta.get("aux_loss_weight", 0.01)
+            config.statement_loss_weight = saved_meta.get("statement_loss_weight", 0.02)
+            config.num_code_experts      = saved_meta.get("num_code_experts", 12)
 
             # 1) build model WITH MoE in __init__
             model = cls(config)
@@ -333,10 +387,17 @@ class MoECausalLM(Qwen3ForCausalLM):
 
             # then convert if requested
             if getattr(config, "moe_layer_indices", []):
-                model._replace_mlp_with_moe(config.moe_layer_indices, config.num_experts_temp, config.top_k)
-                model.router_aux_loss_weight = config.router_aux_loss_weight
-                model.top_k = config.top_k
-                model.num_experts_temp = config.num_experts_temp
+                model._replace_mlp_with_moe(
+                    config.moe_layer_indices,
+                    config.num_experts_temp,
+                    config.top_k,
+                    num_code_experts=getattr(config, "num_code_experts", 12),
+                )
+                model.aux_loss_weight       = getattr(config, "aux_loss_weight", 0.01)
+                model.statement_loss_weight = getattr(config, "statement_loss_weight", 0.02)
+                model.top_k                 = config.top_k
+                model.num_experts_temp      = config.num_experts_temp
+                model.num_code_experts      = config.num_code_experts
 
                 # initialize experts from the (already-loaded) dense mlp
                 # (your copy logic here)
@@ -400,7 +461,7 @@ class MoECausalLM(Qwen3ForCausalLM):
                 return attr, getattr(block, attr)
         raise ValueError(f"Cannot find MLP in block: {type(block)}. Tried: mlp, feed_forward, ffn.")
 
-    def _replace_mlp_with_moe(self, moe_layer_indices, num_experts_temp, top_k):
+    def _replace_mlp_with_moe(self, moe_layer_indices, num_experts_temp, top_k, num_code_experts=12):
         blocks = self._get_transformer_blocks()
         total_layers = len(blocks)
 
@@ -416,6 +477,7 @@ class MoECausalLM(Qwen3ForCausalLM):
                 hidden_size=hidden_size,
                 num_experts_temp=num_experts_temp,
                 top_k=top_k,
+                num_code_experts=num_code_experts,
             )
             setattr(blocks[layer_idx], mlp_attr, moe_mlp)
             self.moe_layers.append(moe_mlp)
@@ -450,15 +512,16 @@ class MoECausalLM(Qwen3ForCausalLM):
         # print(kwargs.get("concept_mat", None))
         for layer in self.moe_layers:
             setattr(layer, "concept_mat", kwargs.get("concept_mat", None))
-            # layer.set
+            setattr(layer, "code_mask", kwargs.get("code_mask", None))
         outputs = super().forward(*args, **kwargs)
-        if outputs.loss is not None and self.moe_layers and self.router_aux_loss_weight > 0.0:
-            # aux_loss = self._get_router_aux_loss(outputs.loss.device)
-            # statement_loss = self._get_router_statement_loss(outputs.loss.device)
-            aux_loss = outputs.loss1 / len(self.moe_layers)
+        if outputs.loss is not None and self.moe_layers:
+            aux_loss       = outputs.loss1 / len(self.moe_layers)
             statement_loss = outputs.loss2 / len(self.moe_layers)
-            # print(statement_loss)
-            outputs.loss = outputs.loss + self.router_aux_loss_weight * aux_loss + self.router_aux_loss_weight * 2 * statement_loss
+            outputs.loss = (
+                outputs.loss
+                + self.aux_loss_weight       * aux_loss
+                + self.statement_loss_weight * statement_loss
+            )
         return outputs
 
     def save_pretrained(self, save_directory, **kwargs):
@@ -475,10 +538,12 @@ class MoECausalLM(Qwen3ForCausalLM):
             kwargs["state_dict"] = stripped_state_dict
         result = self.model.save_pretrained(save_directory, **kwargs)
         metadata = {
-            "moe_layer_indices": self.converted_layer_indices,
-            "num_experts_temp": self.num_experts_temp,
-            "top_k": self.top_k,
-            "router_aux_loss_weight": self.router_aux_loss_weight,
+            "moe_layer_indices":    self.converted_layer_indices,
+            "num_experts_temp":     self.num_experts_temp,
+            "top_k":                self.top_k,
+            "aux_loss_weight":      getattr(self, "aux_loss_weight", 0.01),
+            "statement_loss_weight": getattr(self, "statement_loss_weight", 0.02),
+            "num_code_experts":     getattr(self, "num_code_experts", 12),
         }
         metadata_path = Path(save_directory) / MOE_METADATA_FILENAME
         with metadata_path.open("w", encoding="utf-8") as handle:
@@ -499,7 +564,9 @@ def create_model_and_tokenizer(args):
         moe_layer_indices=args.moe_layer_indices if explicit_moe else None,
         num_experts_temp=args.num_experts_temp if explicit_moe else None,
         top_k=args.moe_top_k if explicit_moe else None,
-        router_aux_loss_weight=args.router_aux_loss_weight if explicit_moe else None,
+        aux_loss_weight=args.aux_loss_weight if explicit_moe else None,
+        statement_loss_weight=args.statement_loss_weight if explicit_moe else None,
+        num_code_experts=args.num_code_experts if explicit_moe else None,
         torch_dtype=getattr(args, "torch_dtype", torch.bfloat16),
         attn_implementation=getattr(args, "attn_implementation", None),
     )

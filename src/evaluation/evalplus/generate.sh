@@ -4,7 +4,10 @@ export MBPP_OVERRIDE_PATH=../../../data/evalplus/mbppplus.jsonl
 # project="qwen3-4B-combined-e_24-layer_33_34_-k_2-all_tokens"
 # INPUT_MODEL="../../../data/saved_models/${project}/"
 # project="Qwen/Qwen3-4B"
-project="qwen3-4B-combined-e_24-layer_33_34_-k_2-all_tokens"
+# project="qwen3-4B-combined-e_24-layer_33_34_-k_2-all_tokens"
+# project="qwen3-4B-code-separate-combined-e_24-layer_33_34_-k_2-all_tokens_lr_5e-5_6_batch_512"
+project="qwen3-4B-code-separate-combined_io-e_16-layer_33_34_-k_2-all_tokens_lr_5e-5_6_batch_512"
+
 INPUT_MODEL="../../../data/saved_models/${project}/"
 # INPUT_MODEL="../../../data/saved_models/${model_dir}/"
 TP=2

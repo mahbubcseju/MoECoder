@@ -38,7 +38,17 @@ def parse_args():
     )
     parser.add_argument("--num_experts_temp", type=int, default=4)
     parser.add_argument("--moe_top_k", type=int, default=1)
-    parser.add_argument("--router_aux_loss_weight", type=float, default=0.01)
+    parser.add_argument("--aux_loss_weight", type=float, default=0.01,
+                        help="Weight for the load-balancing auxiliary loss.")
+    parser.add_argument("--statement_loss_weight", type=float, default=0.02,
+                        help="Weight for the concept-guided contrastive (statement) loss.")
+    parser.add_argument(
+        "--num_code_experts",
+        type=int,
+        default=12,
+        help="Number of experts reserved exclusively for code tokens. "
+             "The remaining (num_experts_temp - num_code_experts) experts handle natural language.",
+    )
     parser.add_argument(
         "--freeze_non_moe",
         action="store_true",
@@ -69,6 +79,11 @@ def normalize_run_flags(args):
         raise ValueError("--num_experts_temp must be >= 2 when using --moe_layer_indices.")
     if args.moe_top_k < 1 or args.moe_top_k > args.num_experts_temp:
         raise ValueError("--moe_top_k must be between 1 and --num_experts_temp.")
+    if args.moe_layer_indices and args.num_code_experts >= args.num_experts_temp:
+        raise ValueError(
+            f"--num_code_experts ({args.num_code_experts}) must be < --num_experts_temp "
+            f"({args.num_experts_temp}) so that at least one expert is reserved for natural language."
+        )
     return args
 
 
@@ -229,13 +244,22 @@ def build_tokenized_example(example, tokenizer, max_length):
         start_code_token_id=code_start,
     )
 
+    # Mark each token as code (1) or natural language (0) based on its
+    # character-offset overlap with the refcode span [code_start, code_end).
+    code_mask = [0] * len(input_ids)
+    for i, (tok_s, tok_e) in enumerate(offsets):
+        if tok_s == tok_e:
+            continue  # skip empty / special tokens
+        if tok_e > code_start and tok_s < code_end:
+            code_mask[i] = 1
+
     return {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "labels": labels,
         "assistant_mask": assistant_mask,
         "concept_mat": concept_mat,
-        # "code_mask": code_mask,
+        "code_mask": code_mask,
     }
 
 
@@ -253,7 +277,7 @@ def build_supervised_collator(tokenizer):
             "labels": [],
             "assistant_mask": [],
             "concept_mat": [],
-            # "code_mask": [],
+            "code_mask": [],
         }
 
         for feature in features:
@@ -263,7 +287,7 @@ def build_supervised_collator(tokenizer):
             batch["labels"].append(feature["labels"] + [-100] * pad_len)
             batch["assistant_mask"].append(feature["assistant_mask"] + [0] * pad_len)
             batch["concept_mat"].append(feature["concept_mat"] + [[-1] * len(concept_mapping)] * pad_len)
-            # batch["code_mask"].append(feature["code_mask"] + [0] * pad_len)
+            batch["code_mask"].append(feature["code_mask"] + [0] * pad_len)
 
         return {key: torch.tensor(value, dtype=torch.long) for key, value in batch.items()}
 
