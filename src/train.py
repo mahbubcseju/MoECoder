@@ -382,19 +382,12 @@ def configure_trainable_parameters(model, args):
 
     set_requires_grad(model, False)
 
-    # 2) Unfreeze MoE layers 34-35: router + experts + norms
-    for i in args.moe_layer_indices:
-        layer = model.model.layers[i]
+    # Unfreeze last 5 layers entirely
+    total_layers = len(model.model.layers)
+    for i in range(total_layers - 5, total_layers):
+        set_requires_grad(model.model.layers[i], True)
 
-        # MoE parts
-        set_requires_grad(layer.mlp.router, True)
-        set_requires_grad(layer.mlp.experts, True)
-
-        # Norms in those layers
-        set_requires_grad(layer.input_layernorm, True)
-        set_requires_grad(layer.post_attention_layernorm, True)
-
-    # 3) Final norm
+    # Final norm
     set_requires_grad(model.model.norm, True)
     # for param in model.parameters():
     #     param.requires_grad = False
