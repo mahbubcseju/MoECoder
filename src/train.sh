@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-project="qwen3-4B-code-separate-combined_io-all_tokens-layers_all-moe_33_34-lr_5e-5_6_batch_512"
+project="qwen3-4B-code-separate-combined_io-all_tokens-layers_all-moe_28_30_32_34-k_2"
 
 saved_model_dir="../data/saved_models/${project}/"
 log_dir="../data/logs/${project}"
@@ -9,6 +9,8 @@ log_dir="../data/logs/${project}"
 mkdir -p ${saved_model_dir}/
 mkdir -p ${log_dir}/
 
+
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 accelerate launch --config_file accelerate_config.yaml train.py \
   --do_train \
   --do_eval \
@@ -24,7 +26,7 @@ accelerate launch --config_file accelerate_config.yaml train.py \
   --learning_rate 5e-5 \
   --min_learning_rate 5e-6 \
   --num_epochs 2 \
-  --moe_layer_indices 33 34 \
+  --moe_layer_indices 28 30 32 34  \
   --num_experts_temp 16 \
   --num_code_experts 8 \
   --moe_top_k 2 \
