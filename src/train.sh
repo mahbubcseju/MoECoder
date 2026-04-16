@@ -9,7 +9,6 @@ log_dir="../data/logs/${project}"
 mkdir -p ${saved_model_dir}/
 mkdir -p ${log_dir}/
 
-
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 accelerate launch --config_file accelerate_config.yaml train.py \
   --do_train \
@@ -18,8 +17,8 @@ accelerate launch --config_file accelerate_config.yaml train.py \
   --output_dir ${saved_model_dir} \
   --data_path "../data/combined/final_dataset_w_io.jsonl" \
   --max_length 8192 \
-  --per_device_batch_size 4 \
-  --gradient_accumulation_steps 32 \
+  --per_device_batch_size 2 \
+  --gradient_accumulation_steps 16 \
   --aux_loss_weight 0.01 \
   --statement_loss_weight 0.01 \
   --freeze_non_moe \

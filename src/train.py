@@ -380,15 +380,15 @@ def configure_trainable_parameters(model, args):
             p.requires_grad = flag
 
 
-    set_requires_grad(model, False)
+    set_requires_grad(model, True)
 
     # Unfreeze last 5 layers entirely
-    total_layers = len(model.model.layers)
-    for i in range(total_layers - 5, total_layers):
-        set_requires_grad(model.model.layers[i], True)
+    # total_layers = len(model.model.layers)
+    # for i in range(total_layers - 10, total_layers):
+    #     set_requires_grad(model.model.layers[i], True)
 
-    # Final norm
-    set_requires_grad(model.model.norm, True)
+    # # Final norm
+    # set_requires_grad(model.model.norm, True)
     # for param in model.parameters():
     #     param.requires_grad = False
 
