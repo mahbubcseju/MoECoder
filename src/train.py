@@ -55,6 +55,38 @@ def parse_args():
         default="flash_attention_2",
         help="Attention implementation to use. Options depend on the model and hardware, but may include 'flash_attention_2', 'triton', 'auto', etc.",
     )
+    # ----- MoE-LoRA args -----
+    parser.add_argument(
+        "--lora_r",
+        type=int,
+        default=0,
+        help="LoRA rank.  Set > 0 to enable MoE-LoRA adapters.",
+    )
+    parser.add_argument(
+        "--lora_alpha",
+        type=float,
+        default=1.0,
+        help="LoRA scaling: adapter output is multiplied by lora_alpha / lora_r.",
+    )
+    parser.add_argument(
+        "--lora_num_experts",
+        type=int,
+        default=4,
+        help="Number of LoRA expert adapters per targeted linear layer.",
+    )
+    parser.add_argument(
+        "--lora_top_k",
+        type=int,
+        default=1,
+        help="Number of LoRA experts selected per token (top-k routing).",
+    )
+    parser.add_argument(
+        "--lora_target_modules",
+        type=str,
+        nargs="*",
+        default=["q_proj", "k_proj", "v_proj", "o_proj"],
+        help="Linear layer names to inject MoE-LoRA into (leaf attribute names).",
+    )
     return parser.parse_args()
 
 
@@ -69,6 +101,13 @@ def normalize_run_flags(args):
         raise ValueError("--num_experts_temp must be >= 2 when using --moe_layer_indices.")
     if args.moe_top_k < 1 or args.moe_top_k > args.num_experts_temp:
         raise ValueError("--moe_top_k must be between 1 and --num_experts_temp.")
+    if args.lora_r > 0:
+        if args.lora_num_experts < 2:
+            raise ValueError("--lora_num_experts must be >= 2 when using --lora_r.")
+        if args.lora_top_k < 1 or args.lora_top_k > args.lora_num_experts:
+            raise ValueError("--lora_top_k must be between 1 and --lora_num_experts.")
+        if not args.lora_target_modules:
+            raise ValueError("--lora_target_modules must not be empty when using --lora_r.")
     return args
 
 
@@ -204,7 +243,7 @@ def build_tokenized_example(example, tokenizer, max_length):
     prompt_len = min(len(prompt_ids), len(input_ids))
 
     labels = input_ids.copy()
-    # labels[:prompt_len] = [-100] * prompt_len
+    labels[:prompt_len] = [-100] * prompt_len
 
     assistant_mask = [0] * len(input_ids)
     for i in range(prompt_len, len(input_ids)):
@@ -348,50 +387,49 @@ def load_tokenized_dataset(args, tokenizer):
 
 
 def configure_trainable_parameters(model, args):
-    if not args.freeze_non_moe:
-        return
-    
-    def set_requires_grad(module, flag: bool):
+    """Freeze/unfreeze parameters according to the training mode.
+
+    Modes (can combine):
+    - MoEMLP only  : --freeze_non_moe  (existing behaviour)
+    - MoE-LoRA     : --lora_r > 0      (freeze base, train LoRA params)
+    - Both          : both flags set
+    - Neither       : all params train
+    """
+    using_lora = bool(args.lora_r)
+    using_moe_mlp = bool(args.moe_layer_indices) and args.freeze_non_moe
+
+    if not using_lora and not using_moe_mlp:
+        return  # full fine-tune, nothing to freeze
+
+    def set_grad(module, flag: bool):
         for p in module.parameters():
             p.requires_grad = flag
 
+    # Start by freezing everything
+    set_grad(model, False)
 
-    set_requires_grad(model, False)
+    # --- MoEMLP path: unfreeze routers, experts, and surrounding norms ---
+    if using_moe_mlp:
+        for i in args.moe_layer_indices:
+            layer = model.model.layers[i]
+            set_grad(layer.mlp.router, True)
+            set_grad(layer.mlp.experts, True)
+            set_grad(layer.input_layernorm, True)
+            set_grad(layer.post_attention_layernorm, True)
+        set_grad(model.model.norm, True)
 
-    # 2) Unfreeze MoE layers 34-35: router + experts + norms
-    for i in args.moe_layer_indices:
-        layer = model.model.layers[i]
+    # --- MoE-LoRA path: unfreeze router + lora_A + lora_B in every injected layer ---
+    if using_lora:
+        for lora_layer in model.moe_lora_layers:
+            set_grad(lora_layer.router, True)
+            set_grad(lora_layer.lora_A, True)
+            set_grad(lora_layer.lora_B, True)
+            # base_linear stays frozen (already set above)
 
-        # MoE parts
-        set_requires_grad(layer.mlp.router, True)
-        set_requires_grad(layer.mlp.experts, True)
-
-        # Norms in those layers
-        set_requires_grad(layer.input_layernorm, True)
-        set_requires_grad(layer.post_attention_layernorm, True)
-
-    # 3) Final norm
-    set_requires_grad(model.model.norm, True)
-    # for param in model.parameters():
-    #     param.requires_grad = False
-
-    # for moe_layer in getattr(model, "moe_layers", []):
-    #     for param in moe_layer.parameters():
-    #         param.requires_grad = True
-
-    # if args.train_output_head:
-    #     head_names = ("lm_head",)
-    #     for head_name in head_names:
-    #         if hasattr(model.base_model, head_name):
-    #             head_module = getattr(model.base_model, head_name)
-    #             for param in head_module.parameters():
-    #                 param.requires_grad = True
     print(model)
     for name, param in model.named_parameters():
-        if param.requires_grad:
-            print("✅", name)
-        else:
-            print("❌", name)
+        status = "✅" if param.requires_grad else "❌"
+        print(status, name)
 
 
 def build_train_components(args, model, tokenized, collator):

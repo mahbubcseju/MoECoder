@@ -40,6 +40,6 @@ python run_cruxeval.py \
     --start 0 \
     --end 800 \
     --shuffle \
-    --tensor_parallel_size 2 \
+    --tensor_parallel_size 1 \
     ${extra_args} \
     2>&1 | tee ${log_dir}/generate${suffix}.log

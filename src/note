@@ -1,0 +1,3 @@
+scp -r semcoder/final_dataset_w_thinking_mode_and_concepts.jsonl rahman11@matrix.llnl.gov:/p/lustre5/rahman11/projects/MoECoder/data/semcoder
+scp -r ex_tr_data/final_dataset_w_thinking_mode_and_concepts.jsonl rahman11@matrix.llnl.gov:/p/lustre5/rahman11/projects/MoECoder/data/ex_tr_data
+scp -r combined/final_dataset_w_thinking_mode_and_concepts.jsonl rahman11@matrix.llnl.gov:/p/lustre5/rahman11/projects/MoECoder/data/combined
