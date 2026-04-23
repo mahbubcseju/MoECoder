@@ -72,13 +72,13 @@ def normalize_run_flags(args):
     return args
 
 
-def render_chat_text(tokenizer, messages, add_generation_prompt):
+def render_chat_text(tokenizer, messages, add_generation_prompt, think=False):
     kwargs = {
         "tokenize": False,
         "add_generation_prompt": add_generation_prompt,
     }
     try:
-        return tokenizer.apply_chat_template(messages, enable_thinking=False, **kwargs)
+        return tokenizer.apply_chat_template(messages, enable_thinking=think, **kwargs)
     except TypeError:
         return tokenizer.apply_chat_template(messages, **kwargs)
 
@@ -204,12 +204,14 @@ def build_tokenized_example(example, tokenizer, max_length):
     prompt_len = min(len(prompt_ids), len(input_ids))
 
     labels = input_ids.copy()
-    # labels[:prompt_len] = [-100] * prompt_len
+    labels[:prompt_len] = [-100] * prompt_len
 
     assistant_mask = [0] * len(input_ids)
     for i in range(prompt_len, len(input_ids)):
         assistant_mask[i] = 1
 
+    # print("full_text:", full_text)
+    # print("refcode:", example['refcode'])
     code_start = full_text.index(example['refcode'])
     code_end = code_start + len(example['refcode'])
     global trainer_flag
@@ -287,7 +289,7 @@ def load_tokenized_dataset(args, tokenizer):
         messages_list.append(
             [
                 {"role": "user", "content": row["user_prompt"]},
-                {"role": "assistant", "content": row["assistant_prompt"]},
+                {"role": "assistant",  "reasoning_content": row['reasoning_content'], "content": row['answer']},
             ]
         )
 
@@ -297,32 +299,34 @@ def load_tokenized_dataset(args, tokenizer):
             "Use a chat-model tokenizer (for example Qwen) or define a custom formatter."
         )
 
-    inputs = render_chat_text(tokenizer, messages_list, add_generation_prompt=False)
+    inputs = render_chat_text(tokenizer, messages_list, think=False, add_generation_prompt=False)
+    # print(inputs[0])
+
     org_count = len(inputs)
     # code_pattern = re.compile(r"```.*?```", flags=re.DOTALL)
 
     filtered_user_prompts = []
-    filtered_assistant_prompts = []
     filtered_messages_list = []
     filtered_texts = []
     filtered_refcodes = []
     filtered_concepts = []
     for row, messages, text in zip(dataset, messages_list, inputs):
         if len(text) <= args.max_length:
+
             filtered_user_prompts.append(row["user_prompt"])
-            filtered_assistant_prompts.append(row["assistant_prompt"])
             filtered_messages_list.append(messages)
             filtered_refcodes.append(row["refcode"])
             filtered_concepts.append(row["concepts"])
             filtered_texts.append(text)
+            # print("full_text:", text)
+            # print("refcode:", row["refcode"])
     messages_list = filtered_messages_list
     print(f"Loaded {org_count} rows. Kept {len(messages_list)} rows after chat-length filter.")
 
-    print(len(filtered_user_prompts), len(filtered_assistant_prompts), len(filtered_refcodes), len(filtered_concepts))
+    print(len(filtered_user_prompts), len(filtered_texts), len(filtered_refcodes), len(filtered_concepts))
     formatted_dataset = Dataset.from_dict(
         {
             "user_prompt": filtered_user_prompts,
-            "assistant_prompt": filtered_assistant_prompts,
             "text": filtered_texts,
             "refcode": filtered_refcodes,
             "concepts": filtered_concepts,
@@ -342,36 +346,36 @@ def load_tokenized_dataset(args, tokenizer):
             tokenizer=tokenizer,
             max_length=args.max_length,
         ),
-        remove_columns=["user_prompt", "assistant_prompt", "text", "refcode", "concepts"],
+        remove_columns=["user_prompt", "text", "refcode", "concepts"],
     )
     return tokenized.filter(lambda x: len(x["input_ids"]) > 0 and any(label != -100 for label in x["labels"]))
 
 
 def configure_trainable_parameters(model, args):
-    if not args.freeze_non_moe:
-        return
+    # if not args.freeze_non_moe:
+    #     return
     
     def set_requires_grad(module, flag: bool):
         for p in module.parameters():
             p.requires_grad = flag
 
 
-    set_requires_grad(model, False)
+    set_requires_grad(model, True)
 
     # 2) Unfreeze MoE layers 34-35: router + experts + norms
-    for i in args.moe_layer_indices:
-        layer = model.model.layers[i]
+    # for i in args.moe_layer_indices:
+    #     layer = model.model.layers[i]
 
-        # MoE parts
-        set_requires_grad(layer.mlp.router, True)
-        set_requires_grad(layer.mlp.experts, True)
+    #     # MoE parts
+    #     set_requires_grad(layer.mlp.router, True)
+    #     set_requires_grad(layer.mlp.experts, True)
 
-        # Norms in those layers
-        set_requires_grad(layer.input_layernorm, True)
-        set_requires_grad(layer.post_attention_layernorm, True)
+    #     # Norms in those layers
+    #     set_requires_grad(layer.input_layernorm, True)
+    #     set_requires_grad(layer.post_attention_layernorm, True)
 
-    # 3) Final norm
-    set_requires_grad(model.model.norm, True)
+    # # 3) Final norm
+    # set_requires_grad(model.model.norm, True)
     # for param in model.parameters():
     #     param.requires_grad = False
 
@@ -408,23 +412,30 @@ def build_train_components(args, model, tokenized, collator):
     # print(trainable_params)
     if not trainable_params:
         raise ValueError("No trainable parameters found. Check freezing/MoE configuration.")
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, weight_decay=0.0,)
     update_steps_per_epoch = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
     max_train_steps = args.num_epochs * update_steps_per_epoch
+    num_warmup_steps = int(0.03 * max_train_steps)
     # lr_scheduler = get_scheduler(
     #     "cosine",
     #     optimizer=optimizer,
     #     num_warmup_steps=args.num_warmup_steps,
     #     num_training_steps=max_train_steps,
     # )
+    # lr_scheduler = get_scheduler(
+    #     "cosine_with_min_lr",
+    #     optimizer=optimizer,
+    #     num_warmup_steps=args.num_warmup_steps,
+    #     num_training_steps=max_train_steps,
+    #     scheduler_specific_kwargs={
+    #         "min_lr": args.min_learning_rate,
+    #     },
+    # )
     lr_scheduler = get_scheduler(
-        "cosine_with_min_lr",
+        "linear",
         optimizer=optimizer,
-        num_warmup_steps=args.num_warmup_steps,
+        num_warmup_steps=num_warmup_steps,
         num_training_steps=max_train_steps,
-        scheduler_specific_kwargs={
-            "min_lr": args.min_learning_rate,
-        },
     )
     return train_loader, optimizer, lr_scheduler
 

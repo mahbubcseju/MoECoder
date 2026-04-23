@@ -475,10 +475,10 @@ class MoECausalLM(Qwen3ForCausalLM):
             kwargs["state_dict"] = stripped_state_dict
         result = self.model.save_pretrained(save_directory, **kwargs)
         metadata = {
-            "moe_layer_indices": self.converted_layer_indices,
-            "num_experts_temp": self.num_experts_temp,
-            "top_k": self.top_k,
-            "router_aux_loss_weight": self.router_aux_loss_weight,
+            "moe_layer_indices":    getattr(self, "converted_layer_indices", []),
+            "num_experts_temp":     getattr(self, "num_experts_temp", 0),
+            "top_k":                getattr(self, "top_k", 0),
+            "router_aux_loss_weight":      getattr(self, "aux_loss_weight", 0.01),
         }
         metadata_path = Path(save_directory) / MOE_METADATA_FILENAME
         with metadata_path.open("w", encoding="utf-8") as handle:

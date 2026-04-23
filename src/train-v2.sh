@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-project="qwen3-4B-combined-thinking_mode_off-e_16-layer_31_32_33_34_-all_layers-assistant_only-k_1"
+project="qwen3-4B-combined-e_16-layer_31_32_33_34_-all_layers-assistant_only-k_2"
 
 saved_model_dir="../data/saved_models/${project}/"
 log_dir="../data/logs/${project}"
@@ -15,15 +15,16 @@ accelerate launch --config_file accelerate_config.yaml train.py \
   --do_eval \
   --model_name Qwen/Qwen3-4B \
   --output_dir ${saved_model_dir} \
-  --data_path "../data/combined/final_dataset_w_thinking_mode_and_concepts.jsonl" \
+  --data_path "../data/combined/final_dataset_w_concepts.jsonl" \
   --max_length 8192 \
   --moe_layer_indices 31 32 33 34 \
   --num_experts_temp 16 \
   --per_device_batch_size 4 \
-  --moe_top_k 1 \
+  --moe_top_k 2 \
   --gradient_accumulation_steps 8 \
   --router_aux_loss_weight 0.01 \
   --freeze_non_moe \
+  --learning_rate 5e-5 \
   --learning_rate 5e-6 \
   --num_epochs 1 \
   --train_output_head > ${log_dir}/train.log 2>&1
