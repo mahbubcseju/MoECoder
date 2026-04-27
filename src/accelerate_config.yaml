@@ -1,6 +1,6 @@
 compute_environment: LOCAL_MACHINE
 distributed_type: DEEPSPEED
-num_processes: 4
+num_processes: 2
 num_machines: 1
 machine_rank: 0
 main_training_function: main
@@ -15,6 +15,6 @@ deepspeed_config:
     offload_optimizer_device: cpu
   bf16:
     enabled: true
-  gradient_accumulation_steps: 8
+  gradient_accumulation_steps: 32
   gradient_clipping: 1.0
-  train_micro_batch_size_per_gpu: 4
+  train_micro_batch_size_per_gpu: 2

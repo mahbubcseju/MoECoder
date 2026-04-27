@@ -219,7 +219,7 @@ def build_tokenized_example(example, tokenizer, max_length):
     prompt_len = min(len(prompt_ids), len(input_ids))
 
     labels = input_ids.copy()
-    # labels[:prompt_len] = [-100] * prompt_len
+    labels[:prompt_len] = [-100] * prompt_len
 
     assistant_mask = [0] * len(input_ids)
     for i in range(prompt_len, len(input_ids)):
@@ -425,9 +425,10 @@ def build_train_components(args, model, tokenized, collator):
     # print(trainable_params)
     if not trainable_params:
         raise ValueError("No trainable parameters found. Check freezing/MoE configuration.")
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, weight_decay=0.0,)
     update_steps_per_epoch = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
     max_train_steps = args.num_epochs * update_steps_per_epoch
+    num_warmup_steps = int(0.03 * max_train_steps)
     # lr_scheduler = get_scheduler(
     #     "cosine",
     #     optimizer=optimizer,
@@ -435,13 +436,10 @@ def build_train_components(args, model, tokenized, collator):
     #     num_training_steps=max_train_steps,
     # )
     lr_scheduler = get_scheduler(
-        "cosine_with_min_lr",
+        "linear",
         optimizer=optimizer,
-        num_warmup_steps=args.num_warmup_steps,
+        num_warmup_steps=num_warmup_steps,
         num_training_steps=max_train_steps,
-        scheduler_specific_kwargs={
-            "min_lr": args.min_learning_rate,
-        },
     )
     return train_loader, optimizer, lr_scheduler
 
