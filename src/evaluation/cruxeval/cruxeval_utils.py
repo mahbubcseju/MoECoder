@@ -389,8 +389,12 @@ def complete_code(
                 d["response"] = text
                 f.write(json.dumps(d) + "\n")
                 f.flush()
-                    
+            flag = 0
             for task_idx, text in zip(generated_tasks, combined_texts):
+                if flag == 0:
+                    print("Example generation:")
+                    print(text)
+                    flag += 1
                 task_idx = int(task_idx.item())
                 if postprocess:
                     text_processed = task.postprocess_generation(text, task_idx)

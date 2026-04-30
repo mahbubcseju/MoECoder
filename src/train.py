@@ -181,6 +181,7 @@ def build_concept_matrix_tokencentric(example, input_ids,tokens, offsets, concep
 
 
 trainer_flag = False
+full_text_should_be_printed = True
 def build_tokenized_example(example, tokenizer, max_length):
     full_text = example["text"]
     prompt_text = render_chat_text(
@@ -188,6 +189,13 @@ def build_tokenized_example(example, tokenizer, max_length):
         [{"role": "user", "content": example["user_prompt"]}],
         add_generation_prompt=True,
     )
+    global full_text_should_be_printed
+    if full_text_should_be_printed:
+        print("*" * 100)
+        print("full_text:", full_text)
+        print("*"* 100)
+        # print("refcode:", example['refcode'])
+        full_text_should_be_printed = False
 
     encoded = tokenizer(
         full_text,
@@ -289,9 +297,11 @@ def load_tokenized_dataset(args, tokenizer):
         messages_list.append(
             [
                 {"role": "user", "content": row["user_prompt"]},
-                {"role": "assistant",  "reasoning_content": row['reasoning_content'], "content": row['answer']},
+                {"role": "assistant",  "reasoning_content": row['reasoning_content'], "content": row['content']},
             ]
         )
+        # if len(messages_list) >= 256:
+        #     break
 
     if tokenizer.chat_template is None:
         raise ValueError(
@@ -299,7 +309,7 @@ def load_tokenized_dataset(args, tokenizer):
             "Use a chat-model tokenizer (for example Qwen) or define a custom formatter."
         )
 
-    inputs = render_chat_text(tokenizer, messages_list, think=False, add_generation_prompt=False)
+    inputs = render_chat_text(tokenizer, messages_list, think=True, add_generation_prompt=False)
     # print(inputs[0])
 
     org_count = len(inputs)

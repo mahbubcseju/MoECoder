@@ -7,12 +7,17 @@ set -euo pipefail
 
 # project="qwen3-4B-wo_exprt"
 # project="qwen3-4B-wo_expert-assistant-only"
-project="qwen3-4B-combined-e_16-layer_31_32_33_34_-all_layers-assistant_only-k_1"
-project="qwen3-4B-combined-thinking_mode-e_16-layer_31_32_33_34_-all_layers-assistant_only-k_1"
+# project="qwen3-4B-combined-e_16-layer_31_32_33_34_-all_layers-assistant_only-k_1"
+# project="qwen3-4B-combined-thinking_mode-e_16-layer_31_32_33_34_-all_layers-assistant_only-k_1"
 
+# project="qwen3-4B-combined-thinking_mode_off-e_16-layer_33_34_-all_layers-assistant_only-k_1"
+# project="qwen3-4B-semcoder-thinking_mode_on-e_16-layer_33_34_-all_layers-assistant_only-k_1"
+# project="Qwen3-4B-thing-lets-step-by-step"
+project="qwen3-4B-semcoder-thinking_mode_on-e_16-layer_33_34_-all_layers-assistant_only-k_1"
 
 cot=true
-model_dir="../../../data/saved_models/${project}/"
+# model_dir="../../../data/saved_models/${project}/"
+model_dir="Qwen/Qwen3-4B"
 
 
 bash generate.sh ${project} ${cot} ${model_dir}

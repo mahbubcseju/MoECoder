@@ -1,18 +1,22 @@
 import copy
 import json
+import shutil
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import load_file
-from modeling_qwen3 import Qwen3ForCausalLM, Qwen3Config, Qwen3Model
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-
 try:
     from transformers.modeling_utils import load_sharded_checkpoint
 except ImportError:  # pragma: no cover - older transformers versions
     load_sharded_checkpoint = None
+
+try:
+    from .modeling_qwen3 import Qwen3ForCausalLM, Qwen3Config, Qwen3Model
+except ImportError:
+    from modeling_qwen3 import Qwen3ForCausalLM, Qwen3Config, Qwen3Model
 
 
 MOE_METADATA_FILENAME = "moe_config.json"
@@ -193,7 +197,7 @@ class Qwen3MoEConfig(Qwen3Config):
         self,
         moe_layer_indices=None,
         num_experts_temp=4,
-        top_k=1,
+        moe_top_k=1,
         router_aux_loss_weight=0.01,
         add_expert_mlp=False,  # signal to model init to build MoE right away (vs. convert later)
         **kwargs,
@@ -201,7 +205,7 @@ class Qwen3MoEConfig(Qwen3Config):
         super().__init__(**kwargs)
         self.moe_layer_indices = moe_layer_indices or []
         self.num_experts_temp = int(num_experts_temp)
-        self.top_k = int(top_k)
+        self.moe_top_k = int(moe_top_k)
         self.router_aux_loss_weight = float(router_aux_loss_weight)
         self.add_expert_mlp = add_expert_mlp
         
@@ -215,7 +219,7 @@ class Qwen3MoEModel(Qwen3Model):
 
         moe_layer_indices = getattr(config, "moe_layer_indices", [])
         num_experts = getattr(config, "num_experts_temp", 4)
-        self.top_k = getattr(config, "top_k", 1)
+        self.moe_top_k = getattr(config, "moe_top_k", 1)
         self.moe_layers  = []
         self.converted_layer_indices = []
         self.router_aux_loss_weight = 0
@@ -229,7 +233,7 @@ class Qwen3MoEModel(Qwen3Model):
                     dense_mlp=dense_mlp,
                     hidden_size=hidden_size,
                     num_experts_temp=num_experts,
-                    top_k=self.top_k,
+                    top_k=self.moe_top_k,
                 )
                 self.moe_layers.append(self.layers[layer_idx].mlp)
                 self.converted_layer_indices.append(layer_idx)
@@ -290,7 +294,7 @@ class MoECausalLM(Qwen3ForCausalLM):
         # user overrides (explicit)
         if moe_layer_indices is not None: config.moe_layer_indices = moe_layer_indices
         if num_experts_temp is not None: config.num_experts_temp = num_experts_temp
-        if top_k is not None: config.top_k = top_k
+        if top_k is not None: config.moe_top_k = top_k
         if router_aux_loss_weight is not None: config.router_aux_loss_weight = router_aux_loss_weight
 
         # check if this directory contains a MoE checkpoint
@@ -306,7 +310,7 @@ class MoECausalLM(Qwen3ForCausalLM):
             # set config from saved metadata
             config.moe_layer_indices = saved_meta["moe_layer_indices"]
             config.num_experts_temp = saved_meta["num_experts_temp"]
-            config.top_k = saved_meta["top_k"]
+            config.moe_top_k = saved_meta.get("moe_top_k", saved_meta.get("top_k", 1))
             config.router_aux_loss_weight = saved_meta.get("router_aux_loss_weight", 0.0)
 
             # 1) build model WITH MoE in __init__
@@ -333,9 +337,9 @@ class MoECausalLM(Qwen3ForCausalLM):
 
             # then convert if requested
             if getattr(config, "moe_layer_indices", []):
-                model._replace_mlp_with_moe(config.moe_layer_indices, config.num_experts_temp, config.top_k)
+                model._replace_mlp_with_moe(config.moe_layer_indices, config.num_experts_temp, config.moe_top_k)
                 model.router_aux_loss_weight = config.router_aux_loss_weight
-                model.top_k = config.top_k
+                model.moe_top_k = config.moe_top_k
                 model.num_experts_temp = config.num_experts_temp
 
                 # initialize experts from the (already-loaded) dense mlp
@@ -458,31 +462,42 @@ class MoECausalLM(Qwen3ForCausalLM):
             aux_loss = outputs.loss1 / len(self.moe_layers)
             statement_loss = outputs.loss2 / len(self.moe_layers)
             # print(statement_loss)
-            outputs.loss = outputs.loss + self.router_aux_loss_weight * aux_loss + self.router_aux_loss_weight * 2 * statement_loss
+            outputs.loss = outputs.loss + self.router_aux_loss_weight * aux_loss + self.router_aux_loss_weight * statement_loss
         return outputs
 
     def save_pretrained(self, save_directory, **kwargs):
         state_dict = kwargs.pop("state_dict", None)
         if state_dict is not None:
-            stripped_state_dict = {}
-            for key, value in state_dict.items():
-                normalized_key = key
-                print(key)
-                # for prefix in ("module.", "base_model."):
-                #     if normalized_key.startswith(prefix):
-                #         normalized_key = normalized_key[len(prefix):]
-                stripped_state_dict[normalized_key] = value
-            kwargs["state_dict"] = stripped_state_dict
-        result = self.model.save_pretrained(save_directory, **kwargs)
+            kwargs["state_dict"] = {key: value for key, value in state_dict.items()}
+
+        # Stamp config fields so the checkpoint is self-contained and loads
+        # correctly without manual edits.
+        self.config.architectures = ["MoECausalLM"]
+        self.config.auto_map = {
+            "AutoConfig": "model.Qwen3MoEConfig",
+            "AutoModel": "model.Qwen3MoEModel",
+            "AutoModelForCausalLM": "model.MoECausalLM",
+        }
+        self.config.add_expert_mlp = bool(self.moe_layers)
+        self.config.use_cache = True   # was disabled during training
+
+        result = super().save_pretrained(save_directory, **kwargs)
         metadata = {
             "moe_layer_indices":    getattr(self, "converted_layer_indices", []),
             "num_experts_temp":     getattr(self, "num_experts_temp", 0),
-            "top_k":                getattr(self, "top_k", 0),
+            "moe_top_k":            getattr(self, "moe_top_k", 1),
             "router_aux_loss_weight":      getattr(self, "aux_loss_weight", 0.01),
         }
         metadata_path = Path(save_directory) / MOE_METADATA_FILENAME
         with metadata_path.open("w", encoding="utf-8") as handle:
             json.dump(metadata, handle, indent=2, sort_keys=True)
+
+        src_dir = Path(__file__).resolve().parent
+        for fname in ("model.py", "modeling_qwen3.py"):
+            src = src_dir / fname
+            if src.exists():
+                shutil.copy2(src, Path(save_directory) / fname)
+
         return result
 
 

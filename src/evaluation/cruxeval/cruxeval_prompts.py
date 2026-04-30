@@ -30,6 +30,20 @@ assert f({input}) == ??
 [THOUGHT]
 """
 
+
+def make_cot_output_prompt_w_think(s):
+    code, input = s
+    return f"""You are a code execution engine. Given a Python function and an assertion, determine the exact output and complete the assertion with a literal value (no expressions, no function calls). Output the final answer between [ANSWER] and [/ANSWER] tags.
+
+[PYTHON]
+{code}
+assert f({input}) == ??
+[/PYTHON]
+<think>
+Let's execute the code step by step:
+"""
+
+
 def make_forward_monologue_output_prompt(s):
     special_token = "[MONOLOGUE]" # We just need a special token to trigger the monologue -- no few-shot examples needed
     code, input = s
