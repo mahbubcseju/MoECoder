@@ -55,6 +55,18 @@ def parse_args():
         default="flash_attention_2",
         help="Attention implementation to use. Options depend on the model and hardware, but may include 'flash_attention_2', 'triton', 'auto', etc.",
     )
+    parser.add_argument(
+        "--reasoning_weight",
+        type=float,
+        default=1.0,
+        help="Loss weight for reasoning_content tokens. Default=1.0",
+    )
+    parser.add_argument(
+        "--content_weight",
+        type=float,
+        default=1.0,
+        help="Loss weight for content tokens. Default=1.0. Use higher values to emphasize content over reasoning.",
+    )
     return parser.parse_args()
 
 
@@ -182,7 +194,43 @@ def build_concept_matrix_tokencentric(example, input_ids,tokens, offsets, concep
 
 trainer_flag = False
 full_text_should_be_printed = True
-def build_tokenized_example(example, tokenizer, max_length):
+
+def compute_loss_weights(full_text, offsets, prompt_len, reasoning_weight=1.0, content_weight=1.0):
+    """
+    Compute loss weights for each token to differentiate between reasoning and content.
+    Returns: (seq_len,) array where reasoning tokens get reasoning_weight and content gets content_weight
+    """
+    seq_len = len(offsets)
+    weights = [0.0] * seq_len
+    
+    # Tokens before prompt_len get 0 weight (ignored in loss)
+    for i in range(prompt_len):
+        weights[i] = 0.0
+    
+    # For remaining tokens, we need to find where reasoning ends and content begins
+    # This requires parsing the full_text to identify these sections
+    # For now, we'll use a heuristic: if reasoning markers exist in text, identify them
+    
+    # Look for <think> or similar markers that might separate reasoning from content
+    think_end = full_text.find("</think>") if "</think>" in full_text else -1
+    
+    if think_end != -1:
+        # Tokens within reasoning section get reasoning_weight
+        for i in range(prompt_len, seq_len):
+            token_start, token_end = offsets[i]
+            if token_end <= think_end:
+                weights[i] = reasoning_weight
+            else:
+                weights[i] = content_weight
+    else:
+        # If no reasoning markers, apply content_weight to all assistant tokens
+        for i in range(prompt_len, seq_len):
+            weights[i] = content_weight
+    
+    return weights
+
+
+def build_tokenized_example(example, tokenizer, max_length, reasoning_weight=1.0, content_weight=1.0):
     full_text = example["text"]
     prompt_text = render_chat_text(
         tokenizer,
@@ -217,6 +265,9 @@ def build_tokenized_example(example, tokenizer, max_length):
     assistant_mask = [0] * len(input_ids)
     for i in range(prompt_len, len(input_ids)):
         assistant_mask[i] = 1
+    
+    # Compute loss weights for reasoning vs content
+    loss_weights = compute_loss_weights(full_text, offsets, prompt_len, reasoning_weight, content_weight)
 
     # print("full_text:", full_text)
     # print("refcode:", example['refcode'])
@@ -245,6 +296,7 @@ def build_tokenized_example(example, tokenizer, max_length):
         "labels": labels,
         "assistant_mask": assistant_mask,
         "concept_mat": concept_mat,
+        "loss_weights": loss_weights,
         # "code_mask": code_mask,
     }
 
@@ -263,6 +315,7 @@ def build_supervised_collator(tokenizer):
             "labels": [],
             "assistant_mask": [],
             "concept_mat": [],
+            "loss_weights": [],
             # "code_mask": [],
         }
 
@@ -273,9 +326,16 @@ def build_supervised_collator(tokenizer):
             batch["labels"].append(feature["labels"] + [-100] * pad_len)
             batch["assistant_mask"].append(feature["assistant_mask"] + [0] * pad_len)
             batch["concept_mat"].append(feature["concept_mat"] + [[-1] * len(concept_mapping)] * pad_len)
+            batch["loss_weights"].append(feature["loss_weights"] + [0.0] * pad_len)
             # batch["code_mask"].append(feature["code_mask"] + [0] * pad_len)
 
-        return {key: torch.tensor(value, dtype=torch.long) for key, value in batch.items()}
+        batch_out = {"input_ids": torch.tensor(batch["input_ids"], dtype=torch.long),
+                     "attention_mask": torch.tensor(batch["attention_mask"], dtype=torch.long),
+                     "labels": torch.tensor(batch["labels"], dtype=torch.long),
+                     "assistant_mask": torch.tensor(batch["assistant_mask"], dtype=torch.long),
+                     "concept_mat": torch.tensor(batch["concept_mat"], dtype=torch.long),
+                     "loss_weights": torch.tensor(batch["loss_weights"], dtype=torch.float)}
+        return batch_out
 
     return collate_fn
 
@@ -283,7 +343,8 @@ def build_supervised_collator(tokenizer):
 def split_batch_for_model(batch):
     aux = {
         "assistant_mask": batch.pop("assistant_mask", None),
-        # "code_mask": batch.pop("code_mask", None),
+        "loss_weights": batch.pop("loss_weights", None),
+        "concept_mat": batch.pop("concept_mat", None),
     }
     return batch, aux
 
@@ -350,11 +411,17 @@ def load_tokenized_dataset(args, tokenizer):
     #     "validation": split["test"].select(range(min(64, len(split["test"])))),
     # })
 
+    # Get weights from args (with defaults)
+    reasoning_weight = getattr(args, 'reasoning_weight', 1.0)
+    content_weight = getattr(args, 'content_weight', 1.0)
+    
     tokenized = split_dataset.map(
         lambda example: build_tokenized_example(
             example,
             tokenizer=tokenizer,
             max_length=args.max_length,
+            reasoning_weight=reasoning_weight,
+            content_weight=content_weight,
         ),
         remove_columns=["user_prompt", "text", "refcode", "concepts"],
     )
@@ -551,10 +618,13 @@ def train(model, train_loader, optimizer, lr_scheduler, accelerator, args, eval_
         print("********************")
     for epoch in range(args.num_epochs):
         for batch in train_loader:
-            batch, _ = split_batch_for_model(batch)
+            batch, aux = split_batch_for_model(batch)
             with accelerator.accumulate(model):
-                # print(batch)
-                outputs = model(**batch)
+                outputs = model(
+                    **batch,
+                    loss_weights=aux["loss_weights"],
+                    concept_mat=aux["concept_mat"],
+                )
                 loss = outputs.loss
                 accelerator.backward(loss)
 
@@ -625,6 +695,9 @@ def main():
             print("No MoE conversion requested. Using the original dense model.")
     tokenized = load_tokenized_dataset(args, tokenizer)
     collator = build_supervised_collator(tokenizer)
+    # Note: You can adjust reasoning_weight and content_weight when calling build_tokenized_example
+    # Example: reasoning_weight=0.5, content_weight=1.0 (emphasize content)
+    # Example: reasoning_weight=1.0, content_weight=2.0 (emphasize content even more)
     print("before build mode components")
     train_loader, optimizer, lr_scheduler, eval_loader = build_mode_components(args, model, tokenized, collator)
     print("before prepare distribution")

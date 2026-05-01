@@ -177,10 +177,9 @@ class MoEMLP(nn.Module):
         # 5) Weighted merge of only top-k
         mixed_output = (topk_expert_outputs * topk_weights.unsqueeze(-1)).sum(dim=2)  # [B, T, H]
 
-        last_aux_loss = self._compute_aux_loss(router_logits, topk_indices)
-        last_statement_loss = self._compute_statement_loss(router_logits)
-        # print
-        return mixed_output, last_aux_loss, last_statement_loss
+        self.last_aux_loss = self._compute_aux_loss(router_logits, topk_indices)
+        self.last_statement_loss = self._compute_statement_loss(router_logits)
+        return mixed_output, self.last_aux_loss, self.last_statement_loss
 
 
 class Qwen3MoEConfig(Qwen3Config):
@@ -449,20 +448,30 @@ class MoECausalLM(Qwen3ForCausalLM):
             return torch.tensor(0.0, device=device)
         return torch.stack(aux_losses).mean()
 
-    def forward(self, *args, **kwargs):
-        # print(kwargs)
-        # print(kwargs.get("concept_mat", None))
+    def forward(self, *args, loss_weights=None, concept_mat=None, **kwargs):
         for layer in self.moe_layers:
-            setattr(layer, "concept_mat", kwargs.get("concept_mat", None))
-            # layer.set
+            setattr(layer, "concept_mat", concept_mat)
         outputs = super().forward(*args, **kwargs)
+
+        if outputs.loss is not None and loss_weights is not None:
+            labels = kwargs.get("labels")
+            shift_logits = outputs.logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            shift_weights = loss_weights[..., 1:].contiguous()
+            per_token_loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                reduction="none",
+            ).view(shift_labels.shape)
+            mask = (shift_labels != -100).float()
+            weighted = per_token_loss * shift_weights * mask
+            outputs.loss = weighted.sum() / (shift_weights * mask).sum().clamp(min=1e-8)
+
         if outputs.loss is not None and self.moe_layers and self.router_aux_loss_weight > 0.0:
-            # aux_loss = self._get_router_aux_loss(outputs.loss.device)
-            # statement_loss = self._get_router_statement_loss(outputs.loss.device)
             aux_loss = outputs.loss1 / len(self.moe_layers)
             statement_loss = outputs.loss2 / len(self.moe_layers)
-            # print(statement_loss)
-            outputs.loss = outputs.loss + self.router_aux_loss_weight * aux_loss + self.router_aux_loss_weight * statement_loss
+            outputs.loss = outputs.loss + self.router_aux_loss_weight * (aux_loss + statement_loss)
+
         return outputs
 
     def save_pretrained(self, save_directory, **kwargs):
