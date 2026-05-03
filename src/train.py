@@ -4,8 +4,9 @@ import re
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from accelerate import Accelerator
-from datasets import Dataset, DatasetDict
+from datasets import Dataset, DatasetDict, Features, Value
 from torch.utils.data import DataLoader
 from transformers import get_scheduler
 
@@ -67,6 +68,19 @@ def parse_args():
         default=1.0,
         help="Loss weight for content tokens. Default=1.0. Use higher values to emphasize content over reasoning.",
     )
+    # DPO arguments
+    parser.add_argument("--do_dpo", action="store_true",
+                        help="Run DPO training after (or instead of) SFT.")
+    parser.add_argument("--dpo_data_path", type=str, default="",
+                        help="Path to the augmented DPO JSONL produced by precompute_ref_logps.py.")
+    parser.add_argument("--dpo_beta", type=float, default=0.1,
+                        help="DPO temperature β. Higher = tighter adherence to the reference policy.")
+    parser.add_argument("--dpo_num_epochs", type=int, default=1)
+    parser.add_argument("--dpo_learning_rate", type=float, default=1e-6)
+    parser.add_argument("--dpo_output_dir", type=str, default="",
+                        help="Where to save the DPO checkpoint. Defaults to <output_dir>/dpo.")
+    parser.add_argument("--dpo_sample_size", type=int, default=0,
+                        help="Use only the first N DPO examples. 0 = use all data (default). Useful for quick smoke tests.")
     return parser.parse_args()
 
 
@@ -75,7 +89,7 @@ def tokenize_fn(examples, tokenizer, max_length):
 
 
 def normalize_run_flags(args):
-    if not args.do_train and not args.do_eval:
+    if not args.do_train and not args.do_eval and not args.do_dpo:
         args.do_train = True
     if args.moe_layer_indices and args.num_experts_temp < 2:
         raise ValueError("--num_experts_temp must be >= 2 when using --moe_layer_indices.")
@@ -660,6 +674,311 @@ def save_checkpoint(model, tokenizer, accelerator, output_dir):
         tokenizer.save_pretrained(output_dir)
 
 
+# ============================================================
+# DPO data pipeline
+# ============================================================
+
+def _tokenize_dpo_pair(example, tokenizer, max_length):
+    """Tokenize one chosen/rejected pair. Returns a 6-tuple of lists (no ref log probs)."""
+    prompt_text = render_chat_text(
+        tokenizer,
+        [{"role": "user", "content": example["prompt"]}],
+        add_generation_prompt=True,
+    )
+    chosen_text = render_chat_text(
+        tokenizer,
+        [
+            {"role": "user", "content": example["prompt"]},
+            {
+                "role": "assistant",
+                "reasoning_content": example["chosen"]["reasoning_content"],
+                "content": f"\n\n[ANSWER]\n{example['chosen']['content']}\n[/ANSWER]",
+            },
+        ],
+        think=True,
+        add_generation_prompt=False,
+    )
+    rejected_text = render_chat_text(
+        tokenizer,
+        [
+            {"role": "user", "content": example["prompt"]},
+            {
+                "role": "assistant",
+                "reasoning_content": example["rejected"]["reasoning_content"],
+                "content": f"\n\n[ANSWER]\n{example['rejected']['content']}\n[/ANSWER]",
+            },
+        ],
+        think=True,
+        add_generation_prompt=False,
+    )
+
+    prompt_ids   = tokenizer(prompt_text,   add_special_tokens=False)["input_ids"]
+    chosen_enc   = tokenizer(chosen_text,   truncation=True, max_length=max_length, add_special_tokens=False)
+    rejected_enc = tokenizer(rejected_text, truncation=True, max_length=max_length, add_special_tokens=False)
+
+    prompt_len_c = min(len(prompt_ids), len(chosen_enc["input_ids"]))
+    prompt_len_r = min(len(prompt_ids), len(rejected_enc["input_ids"]))
+
+    chosen_labels   = chosen_enc["input_ids"].copy()
+    chosen_labels[:prompt_len_c] = [-100] * prompt_len_c
+
+    rejected_labels = rejected_enc["input_ids"].copy()
+    rejected_labels[:prompt_len_r] = [-100] * prompt_len_r
+
+    return (
+        chosen_enc["input_ids"],   chosen_enc["attention_mask"],   chosen_labels,
+        rejected_enc["input_ids"], rejected_enc["attention_mask"], rejected_labels,
+    )
+
+
+def build_dpo_tokenized_example(example, tokenizer, max_length):
+    """Tokenize one DPO example. Prompt positions are masked (-100) in labels."""
+    c_ids, c_mask, c_labs, r_ids, r_mask, r_labs = _tokenize_dpo_pair(example, tokenizer, max_length)
+    return {
+        "chosen_input_ids":        c_ids,
+        "chosen_attention_mask":   c_mask,
+        "chosen_labels":           c_labs,
+        "rejected_input_ids":      r_ids,
+        "rejected_attention_mask": r_mask,
+        "rejected_labels":         r_labs,
+        "ref_chosen_logp":         example["ref_chosen_logp"],
+        "ref_rejected_logp":       example["ref_rejected_logp"],
+    }
+
+
+def precompute_dpo_ref_logps_inline(raw_dataset, model, tokenizer, args, accelerator):
+    """
+    Compute ref log probs from the current (SFT) model weights in a single no-grad pass.
+    Used when --do_train and --do_dpo are combined, so no separate precompute script is needed.
+    Returns an augmented Dataset with ref_chosen_logp and ref_rejected_logp added.
+    """
+    pad_id    = tokenizer.pad_token_id
+    ref_model = accelerator.unwrap_model(model)
+    device    = next(ref_model.parameters()).device
+
+    was_training = ref_model.training
+    ref_model.eval()
+
+    all_chosen_logps, all_rejected_logps = [], []
+
+    def _pad(seqs, val):
+        ml = max(len(s) for s in seqs)
+        return torch.tensor([s + [val] * (ml - len(s)) for s in seqs], dtype=torch.long, device=device)
+
+    for start in range(0, len(raw_dataset), args.per_device_batch_size):
+        rows = [raw_dataset[i] for i in range(start, min(start + args.per_device_batch_size, len(raw_dataset)))]
+        tok  = [_tokenize_dpo_pair(r, tokenizer, args.max_length) for r in rows]
+
+        c_ids  = [t[0] for t in tok];  c_mask = [t[1] for t in tok];  c_labs = [t[2] for t in tok]
+        r_ids  = [t[3] for t in tok];  r_mask = [t[4] for t in tok];  r_labs = [t[5] for t in tok]
+
+        with torch.no_grad():
+            chosen_logps = compute_sequence_log_probs(
+                ref_model(input_ids=_pad(c_ids, pad_id), attention_mask=_pad(c_mask, 0), skip_moe_losses=True).logits,
+                _pad(c_labs, -100),
+            )
+            rejected_logps = compute_sequence_log_probs(
+                ref_model(input_ids=_pad(r_ids, pad_id), attention_mask=_pad(r_mask, 0), skip_moe_losses=True).logits,
+                _pad(r_labs, -100),
+            )
+
+        all_chosen_logps.extend(chosen_logps.cpu().tolist())
+        all_rejected_logps.extend(rejected_logps.cpu().tolist())
+
+    if was_training:
+        ref_model.train()
+
+    augmented = []
+    for i, row in enumerate(raw_dataset):
+        record = dict(row)
+        record["ref_chosen_logp"]   = all_chosen_logps[i]
+        record["ref_rejected_logp"] = all_rejected_logps[i]
+        augmented.append(record)
+
+    return Dataset.from_list(augmented)
+
+
+def _load_dpo_json(path):
+    import json
+    needed = {"reasoning_content", "content"}
+    rows = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            clean = {
+                "prompt": row["prompt"],
+                "chosen": {k: row["chosen"][k] for k in needed},
+                "rejected": {k: row["rejected"][k] for k in needed},
+            }
+            if "ref_chosen_logp" in row:
+                clean["ref_chosen_logp"] = row["ref_chosen_logp"]
+            if "ref_rejected_logp" in row:
+                clean["ref_rejected_logp"] = row["ref_rejected_logp"]
+            rows.append(clean)
+    return Dataset.from_list(rows)
+
+
+def load_dpo_dataset(args, tokenizer, raw_dataset=None):
+    if raw_dataset is None:
+        raw_dataset = _load_dpo_json(str(args.dpo_data_path))
+    print(f"Loaded {len(raw_dataset)} DPO examples from {args.dpo_data_path}")
+
+    tokenized = raw_dataset.map(
+        lambda ex: build_dpo_tokenized_example(ex, tokenizer, args.max_length),
+        remove_columns=raw_dataset.column_names,
+    )
+    tokenized = tokenized.filter(
+        lambda x: (
+            any(l != -100 for l in x["chosen_labels"])
+            and any(l != -100 for l in x["rejected_labels"])
+        )
+    )
+    split = tokenized.train_test_split(test_size=0.1, seed=42)
+    return DatasetDict({"train": split["train"], "validation": split["test"]})
+
+
+def build_dpo_collator(tokenizer):
+    pad_id = tokenizer.pad_token_id
+
+    def collate_fn(features):
+        max_c = max(len(f["chosen_input_ids"])   for f in features)
+        max_r = max(len(f["rejected_input_ids"]) for f in features)
+        batch = {k: [] for k in (
+            "chosen_input_ids", "chosen_attention_mask", "chosen_labels",
+            "rejected_input_ids", "rejected_attention_mask", "rejected_labels",
+            "ref_chosen_logp", "ref_rejected_logp",
+        )}
+        for f in features:
+            cp = max_c - len(f["chosen_input_ids"])
+            batch["chosen_input_ids"].append(f["chosen_input_ids"]       + [pad_id] * cp)
+            batch["chosen_attention_mask"].append(f["chosen_attention_mask"] + [0]      * cp)
+            batch["chosen_labels"].append(f["chosen_labels"]             + [-100]  * cp)
+
+            rp = max_r - len(f["rejected_input_ids"])
+            batch["rejected_input_ids"].append(f["rejected_input_ids"]       + [pad_id] * rp)
+            batch["rejected_attention_mask"].append(f["rejected_attention_mask"] + [0]      * rp)
+            batch["rejected_labels"].append(f["rejected_labels"]             + [-100]  * rp)
+
+            batch["ref_chosen_logp"].append(f["ref_chosen_logp"])
+            batch["ref_rejected_logp"].append(f["ref_rejected_logp"])
+
+        return {
+            "chosen_input_ids":        torch.tensor(batch["chosen_input_ids"],        dtype=torch.long),
+            "chosen_attention_mask":   torch.tensor(batch["chosen_attention_mask"],   dtype=torch.long),
+            "chosen_labels":           torch.tensor(batch["chosen_labels"],           dtype=torch.long),
+            "rejected_input_ids":      torch.tensor(batch["rejected_input_ids"],      dtype=torch.long),
+            "rejected_attention_mask": torch.tensor(batch["rejected_attention_mask"], dtype=torch.long),
+            "rejected_labels":         torch.tensor(batch["rejected_labels"],         dtype=torch.long),
+            "ref_chosen_logp":         torch.tensor(batch["ref_chosen_logp"],         dtype=torch.float),
+            "ref_rejected_logp":       torch.tensor(batch["ref_rejected_logp"],       dtype=torch.float),
+        }
+
+    return collate_fn
+
+
+# ============================================================
+# DPO loss and training
+# ============================================================
+
+def compute_sequence_log_probs(logits, labels):
+    """Returns [B] — sum of log probs over non-masked response tokens."""
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = labels[:, 1:].contiguous()
+    log_probs = F.log_softmax(shift_logits.float(), dim=-1)
+    token_log_probs = log_probs.gather(
+        dim=-1, index=shift_labels.clamp(min=0).unsqueeze(-1)
+    ).squeeze(-1)
+    mask = (shift_labels != -100).float()
+    return (token_log_probs * mask).sum(dim=-1)
+
+
+def dpo_loss(policy_chosen_logps, policy_rejected_logps, ref_chosen_logps, ref_rejected_logps, beta):
+    chosen_rewards   = beta * (policy_chosen_logps   - ref_chosen_logps)
+    rejected_rewards = beta * (policy_rejected_logps - ref_rejected_logps)
+    losses   = -F.logsigmoid(chosen_rewards - rejected_rewards)
+    accuracy = (chosen_rewards > rejected_rewards).float().mean()
+    return losses.mean(), chosen_rewards.detach().mean(), rejected_rewards.detach().mean(), accuracy
+
+
+def build_dpo_train_components(args, model, dpo_tokenized, collator):
+    dpo_train_loader = DataLoader(
+        dpo_tokenized["train"],
+        shuffle=True,
+        batch_size=args.per_device_batch_size,
+        collate_fn=collator,
+    )
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.dpo_learning_rate, weight_decay=0.0)
+    update_steps_per_epoch = math.ceil(len(dpo_train_loader) / args.gradient_accumulation_steps)
+    max_train_steps = args.dpo_num_epochs * update_steps_per_epoch
+    num_warmup = int(0.03 * max_train_steps)
+    lr_scheduler = get_scheduler(
+        "linear",
+        optimizer=optimizer,
+        num_warmup_steps=num_warmup,
+        num_training_steps=max_train_steps,
+    )
+    return dpo_train_loader, optimizer, lr_scheduler
+
+
+def train_dpo(model, dpo_train_loader, optimizer, lr_scheduler, accelerator, args):
+    model.train()
+    global_step = 0
+
+    if accelerator.is_main_process:
+        print(f"DPO: {args.dpo_num_epochs} epoch(s), {len(dpo_train_loader)} steps/epoch, β={args.dpo_beta}")
+
+    for epoch in range(args.dpo_num_epochs):
+        for batch in dpo_train_loader:
+            with accelerator.accumulate(model):
+                chosen_out = model(
+                    input_ids=batch["chosen_input_ids"],
+                    attention_mask=batch["chosen_attention_mask"],
+                    skip_moe_losses=True,
+                )
+                policy_chosen_logps = compute_sequence_log_probs(
+                    chosen_out.logits, batch["chosen_labels"]
+                )
+
+                rejected_out = model(
+                    input_ids=batch["rejected_input_ids"],
+                    attention_mask=batch["rejected_attention_mask"],
+                    skip_moe_losses=True,
+                )
+                policy_rejected_logps = compute_sequence_log_probs(
+                    rejected_out.logits, batch["rejected_labels"]
+                )
+
+                loss, chosen_rew, rejected_rew, acc = dpo_loss(
+                    policy_chosen_logps,
+                    policy_rejected_logps,
+                    batch["ref_chosen_logp"],
+                    batch["ref_rejected_logp"],
+                    args.dpo_beta,
+                )
+
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+
+            if accelerator.sync_gradients:
+                global_step += 1
+                if global_step % args.logging_steps == 0 and accelerator.is_main_process:
+                    print(
+                        f"[DPO] epoch={epoch} step={global_step} "
+                        f"loss={loss.item():.4f} "
+                        f"chosen_rew={chosen_rew.item():.4f} "
+                        f"rejected_rew={rejected_rew.item():.4f} "
+                        f"acc={acc.item():.4f}"
+                    )
+
+
 def run_requested_tasks(args, model, tokenizer, accelerator, train_loader, optimizer, lr_scheduler, eval_loader):
     if args.do_train:
         train(model, train_loader, optimizer, lr_scheduler, accelerator, args, eval_loader=eval_loader)
@@ -673,7 +992,15 @@ def main():
     args = normalize_run_flags(parse_args())
     accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
 
-    # args.gradient_accumulation_steps = accelerator.gradient_accumulation_steps
+    # DeepSpeed strips train_micro_batch_size_per_gpu from the YAML and may not
+    # re-inject it into deepspeed_config, causing _prepare_deepspeed to raise when
+    # no dataloader is passed (e.g. DPO-only mode). Set it explicitly here.
+    if (hasattr(accelerator.state, "deepspeed_plugin")
+            and accelerator.state.deepspeed_plugin is not None):
+        ds_cfg = accelerator.state.deepspeed_plugin.deepspeed_config
+        if not isinstance(ds_cfg.get("train_micro_batch_size_per_gpu"), int):
+            ds_cfg["train_micro_batch_size_per_gpu"] = args.per_device_batch_size
+
     model, tokenizer = create_model_and_tokenizer(args)
 
     configure_trainable_parameters(model, args)
@@ -689,17 +1016,61 @@ def main():
         if model.converted_layer_indices:
             print(
                 "Converted MLP->MoE layers: "
-                f"{model.converted_layer_indices} | num_experts_temp={args.num_experts_temp} | top_k={args.moe_top_k}"
+                f"{model.converted_layer_indices} | num_experts_temp={model.num_experts_temp} | top_k={model.moe_top_k}"
             )
         else:
             print("No MoE conversion requested. Using the original dense model.")
-    tokenized = load_tokenized_dataset(args, tokenizer)
-    collator = build_supervised_collator(tokenizer)
-    # Note: You can adjust reasoning_weight and content_weight when calling build_tokenized_example
-    # Example: reasoning_weight=0.5, content_weight=1.0 (emphasize content)
-    # Example: reasoning_weight=1.0, content_weight=2.0 (emphasize content even more)
-    print("before build mode components")
-    train_loader, optimizer, lr_scheduler, eval_loader = build_mode_components(args, model, tokenized, collator)
+    # === SFT data & components ===
+    train_loader = optimizer = lr_scheduler = eval_loader = None
+    if args.do_train or args.do_eval:
+        tokenized = load_tokenized_dataset(args, tokenizer)
+        collator = build_supervised_collator(tokenizer)
+        print("before build mode components")
+        train_loader, optimizer, lr_scheduler, eval_loader = build_mode_components(
+            args, model, tokenized, collator
+        )
+
+    # === DPO data & components (built BEFORE prepare so DeepSpeed sees the optimizer) ===
+    dpo_train_loader = dpo_optimizer = dpo_scheduler = None
+    dpo_output_dir = None
+    if args.do_dpo:
+        if args.do_train:
+            raise ValueError(
+                "Combined --do_train --do_dpo is not supported with DeepSpeed "
+                "(cannot re-initialize the engine mid-script). "
+                "Run SFT first, then run --do_dpo as a separate job."
+            )
+        if not args.dpo_data_path:
+            raise ValueError("--dpo_data_path is required when --do_dpo is set.")
+        dpo_output_dir = args.dpo_output_dir or str(Path(args.output_dir) / "dpo")
+
+        if accelerator.is_main_process:
+            print(f"\n{'='*60}\nPreparing DPO  →  {dpo_output_dir}\n{'='*60}")
+
+        raw_dpo = _load_dpo_json(str(args.dpo_data_path))
+        if args.dpo_sample_size > 0:
+            raw_dpo = raw_dpo.select(range(min(args.dpo_sample_size, len(raw_dpo))))
+            if accelerator.is_main_process:
+                print(f"DPO sample size: using {len(raw_dpo)} examples.")
+
+        if "ref_chosen_logp" not in raw_dpo.column_names:
+            if accelerator.is_main_process:
+                print("ref_chosen_logp not found — computing inline from current model weights.")
+            # Move to GPU for fast precompute; DeepSpeed will manage placement during prepare.
+            model.to(accelerator.device)
+            raw_dpo = precompute_dpo_ref_logps_inline(raw_dpo, model, tokenizer, args, accelerator)
+
+        dpo_tokenized = load_dpo_dataset(args, tokenizer, raw_dataset=raw_dpo)
+        dpo_collator  = build_dpo_collator(tokenizer)
+        dpo_train_loader, dpo_optimizer, dpo_scheduler = build_dpo_train_components(
+            args, model, dpo_tokenized, dpo_collator
+        )
+        # Route into the prepare call so DeepSpeed gets model + optimizer together.
+        train_loader  = dpo_train_loader
+        optimizer     = dpo_optimizer
+        lr_scheduler  = dpo_scheduler
+
+    # === Single prepare call — DeepSpeed requires model + optimizer together ===
     print("before prepare distribution")
     model, train_loader, optimizer, lr_scheduler, eval_loader = prepare_distributed_components(
         accelerator,
@@ -709,8 +1080,23 @@ def main():
         lr_scheduler=lr_scheduler,
         eval_loader=eval_loader,
     )
+
+    # Route prepared components back to their respective phases.
+    if args.do_dpo:
+        dpo_train_loader = train_loader
+        dpo_optimizer    = optimizer
+        dpo_scheduler    = lr_scheduler
+
+    # === SFT ===
     print("run task")
     run_requested_tasks(args, model, tokenizer, accelerator, train_loader, optimizer, lr_scheduler, eval_loader)
+
+    # === DPO ===
+    if args.do_dpo:
+        if accelerator.is_main_process:
+            print(f"\n{'='*60}\nStarting DPO training\n{'='*60}")
+        train_dpo(model, dpo_train_loader, dpo_optimizer, dpo_scheduler, accelerator, args)
+        save_checkpoint(model, tokenizer, accelerator, dpo_output_dir)
 
 
 if __name__ == "__main__":

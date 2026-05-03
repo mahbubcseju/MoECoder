@@ -283,6 +283,50 @@ class MoECausalLM(Qwen3ForCausalLM):
         with metadata_path.open("r", encoding="utf-8") as handle:
             return json.load(handle)
 
+    @classmethod
+    def _load_full_state_dict(cls, checkpoint_dir, torch_dtype=None):
+        """Read every tensor from all safetensors shards into one state dict."""
+        from safetensors import safe_open
+        ckpt_dir = Path(str(checkpoint_dir))
+        sf_files = sorted(ckpt_dir.glob("*.safetensors"))
+        if not sf_files:
+            raise FileNotFoundError(f"No .safetensors files found in {ckpt_dir}")
+        state_dict: dict[str, torch.Tensor] = {}
+        for sf in sf_files:
+            with safe_open(str(sf), framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    t = f.get_tensor(key)
+                    state_dict[key] = t.to(torch_dtype) if torch_dtype is not None else t
+        return state_dict
+
+    @classmethod
+    def _load_moe_weights(cls, model, checkpoint_dir, torch_dtype=None):
+        """
+        Load only the expert and router weights from a checkpoint into an already-
+        converted MoE model.  Uses safetensors lazy loading so only the needed
+        tensors are read off disk.
+        """
+        from safetensors import safe_open
+
+        ckpt_dir = Path(str(checkpoint_dir))
+        sf_files = sorted(ckpt_dir.glob("*.safetensors"))
+        if not sf_files:
+            raise FileNotFoundError(f"No .safetensors files found in {ckpt_dir}")
+
+        moe_state: dict[str, torch.Tensor] = {}
+        for sf in sf_files:
+            with safe_open(str(sf), framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    if ".mlp.experts." in key or ".mlp.router." in key:
+                        t = f.get_tensor(key)
+                        moe_state[key] = t.to(torch_dtype) if torch_dtype is not None else t
+
+        if not moe_state:
+            return
+
+        missing, unexpected = model.load_state_dict(moe_state, strict=False)
+        if unexpected:
+            print(f"[_load_moe_weights] unexpected keys (first 5): {unexpected[:5]}")
 
     @classmethod
     def from_pretrained(cls, path, *, moe_layer_indices=None, num_experts_temp=None,
@@ -304,26 +348,35 @@ class MoECausalLM(Qwen3ForCausalLM):
 
         # If we are loading a saved MoE checkpoint (and user didn't explicitly override to "dense"):
         loading_moe = saved_meta is not None and moe_layer_indices is None
-
+        
         if loading_moe:
-            # set config from saved metadata
             config.moe_layer_indices = saved_meta["moe_layer_indices"]
             config.num_experts_temp = saved_meta["num_experts_temp"]
             config.moe_top_k = saved_meta.get("moe_top_k", saved_meta.get("top_k", 1))
             config.router_aux_loss_weight = saved_meta.get("router_aux_loss_weight", 0.0)
+            config.add_expert_mlp = True   # build MoE layers in __init__
 
-            # 1) build model WITH MoE in __init__
+            torch_dtype = kwargs.get("torch_dtype", None)
+
+            # Build the model with MoE architecture already in place so that
+            # every key in the checkpoint has a matching key in the model.
             model = cls(config)
+            if torch_dtype is not None:
+                model = model.to(torch_dtype)
 
-            # 2) now load weights into existing MoE modules
+            # Load all weights (dense + expert + router) in one shot.
             state_dict = kwargs.pop("state_dict", None)
             if state_dict is None:
-                # let HF fetch weights then load; we can reuse the internal loader:
-                model = super(Qwen3ForCausalLM, model).from_pretrained(path, config=config, **kwargs)
-                # NOTE: this line is illustrative; see note below.
-            else:
-                model.load_state_dict(state_dict, strict=True)
+                state_dict = cls._load_full_state_dict(path, torch_dtype=torch_dtype)
+            missing, unexpected = model.load_state_dict(state_dict, strict=True)
+            if missing:
+                print(f"[from_pretrained] missing keys (first 5): {missing[:5]}")
+            if unexpected:
+                print(f"[from_pretrained] unexpected keys (first 5): {unexpected[:5]}")
 
+            model.router_aux_loss_weight = config.router_aux_loss_weight
+            model.moe_top_k = config.moe_top_k
+            model.num_experts_temp = config.num_experts_temp
             return model
 
         else:
@@ -341,8 +394,11 @@ class MoECausalLM(Qwen3ForCausalLM):
                 model.moe_top_k = config.moe_top_k
                 model.num_experts_temp = config.num_experts_temp
 
-                # initialize experts from the (already-loaded) dense mlp
-                # (your copy logic here)
+                # If this is a saved MoE checkpoint, load the expert/router weights
+                # that were skipped during the dense load above.
+                if saved_meta is not None:
+                    torch_dtype = kwargs.get("torch_dtype", None)
+                    cls._load_moe_weights(model, path, torch_dtype=torch_dtype)
 
             return model
     
@@ -448,9 +504,11 @@ class MoECausalLM(Qwen3ForCausalLM):
             return torch.tensor(0.0, device=device)
         return torch.stack(aux_losses).mean()
 
-    def forward(self, *args, loss_weights=None, concept_mat=None, **kwargs):
+    def forward(self, *args, loss_weights=None, concept_mat=None, skip_moe_losses=False, **kwargs):
         for layer in self.moe_layers:
-            setattr(layer, "concept_mat", concept_mat)
+            # Clear concept_mat when skipping MoE losses (e.g. DPO) so that
+            # _compute_statement_loss short-circuits and stale SFT values don't linger.
+            setattr(layer, "concept_mat", None if skip_moe_losses else concept_mat)
         outputs = super().forward(*args, **kwargs)
 
         if outputs.loss is not None and loss_weights is not None:
@@ -467,7 +525,10 @@ class MoECausalLM(Qwen3ForCausalLM):
             weighted = per_token_loss * shift_weights * mask
             outputs.loss = weighted.sum() / (shift_weights * mask).sum().clamp(min=1e-8)
 
-        if outputs.loss is not None and self.moe_layers and self.router_aux_loss_weight > 0.0:
+        if (not skip_moe_losses
+                and outputs.loss is not None
+                and self.moe_layers
+                and self.router_aux_loss_weight > 0.0):
             aux_loss = outputs.loss1 / len(self.moe_layers)
             statement_loss = outputs.loss2 / len(self.moe_layers)
             outputs.loss = outputs.loss + self.router_aux_loss_weight * (aux_loss + statement_loss)
@@ -495,7 +556,7 @@ class MoECausalLM(Qwen3ForCausalLM):
             "moe_layer_indices":    getattr(self, "converted_layer_indices", []),
             "num_experts_temp":     getattr(self, "num_experts_temp", 0),
             "moe_top_k":            getattr(self, "moe_top_k", 1),
-            "router_aux_loss_weight":      getattr(self, "aux_loss_weight", 0.01),
+            "router_aux_loss_weight":      getattr(self, "router_aux_loss_weight", 0.01),
         }
         metadata_path = Path(save_directory) / MOE_METADATA_FILENAME
         with metadata_path.open("w", encoding="utf-8") as handle:
