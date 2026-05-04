@@ -1,12 +1,11 @@
 import argparse
 import math
-import re
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
-from datasets import Dataset, DatasetDict, Features, Value
+from datasets import Dataset, DatasetDict
 from torch.utils.data import DataLoader
 from transformers import get_scheduler
 
@@ -37,8 +36,12 @@ def parse_args():
         default=[],
         help="Transformer block indices whose MLP will be replaced by MoE.",
     )
-    parser.add_argument("--num_experts_temp", type=int, default=4)
-    parser.add_argument("--moe_top_k", type=int, default=1)
+    parser.add_argument("--num_nl_experts", type=int, default=4,
+                        help="Number of NL experts in each MoE layer.")
+    parser.add_argument("--moe_top_k", type=int, default=1,
+                        help="Top-k for NL expert routing.")
+    parser.add_argument("--top_k_code", type=int, default=None,
+                        help="Max number of concept experts per code token. Default: all active concepts.")
     parser.add_argument("--router_aux_loss_weight", type=float, default=0.01)
     parser.add_argument(
         "--freeze_non_moe",
@@ -91,10 +94,13 @@ def tokenize_fn(examples, tokenizer, max_length):
 def normalize_run_flags(args):
     if not args.do_train and not args.do_eval and not args.do_dpo:
         args.do_train = True
-    if args.moe_layer_indices and args.num_experts_temp < 2:
-        raise ValueError("--num_experts_temp must be >= 2 when using --moe_layer_indices.")
-    if args.moe_top_k < 1 or args.moe_top_k > args.num_experts_temp:
-        raise ValueError("--moe_top_k must be between 1 and --num_experts_temp.")
+    if args.moe_layer_indices and args.num_nl_experts < 1:
+        raise ValueError("--num_nl_experts must be >= 1 when using --moe_layer_indices.")
+    if args.moe_top_k < 1 or args.moe_top_k > args.num_nl_experts:
+        raise ValueError("--moe_top_k must be between 1 and --num_nl_experts.")
+    if args.top_k_code is not None and args.top_k_code < 1:
+        raise ValueError("--top_k_code must be >= 1.")
+    args.num_concepts = len(concepts)
     return args
 
 
@@ -130,79 +136,73 @@ concept_mapping = {concept: idx for idx, concept in enumerate(concepts)}
 
 import numpy as np
 trainer_flag_1 = False
-def build_concept_matrix_tokencentric(example, input_ids,tokens, offsets, concept_mapping, start_code_token_id=None):
+def build_concept_matrix_tokencentric(example, input_ids, tokens, offsets, concept_mapping, start_code_token_id=None):
     """
-    Builds (seq_len, num_concepts) matrix:
-      - if token overlaps >=1 concept span => one-hot (or multi-hot if overlaps multiple)
-      - if token overlaps none => all -1
-
-    Requires concept spans in CHAR OFFSETS:
-      example["concept"][name] = [(start_char, end_char), ...]
-      or [[start_char, end_char], ...]
+    Builds (seq_len, num_concepts) matrix where each entry is:
+      -1  : token not covered by any concept span (NL token or bare code token)
+       0  : token is in the code region and at least one concept is active, but NOT this one
+      >0  : minimum char-span length of the overlapping spans for this concept
+            (smaller = more specific/closer concept, e.g. x+y < call(...) < if (...))
     """
     seq_len = len(input_ids)
     num_concepts = len(concept_mapping)
 
-    # Default: tokens not covered by any concept => all -1
-    mat = np.full((seq_len, num_concepts), -1, dtype=np.int8)
+    # int32 to hold span lengths (can be >> 127)
+    mat = np.full((seq_len, num_concepts), -1, dtype=np.int32)
 
-    # 1) Flatten all concept intervals
+    # 1) Flatten all concept intervals; store span length alongside
     intervals = []
     concept_dict = example.get("concepts", {})
-    # print("concept_dict:", concept_dict)
     for cname, spans in concept_dict.items():
         if cname not in concept_mapping:
             continue
         c = concept_mapping[cname]
         for s in spans:
-            # print(s)
             if not (isinstance(s, (list, tuple)) and len(s) == 2):
                 continue
             a, b = int(s[0]), int(s[1])
             if a < b:
-                intervals.append((a + start_code_token_id, b + start_code_token_id, c))
+                abs_a = a + start_code_token_id
+                abs_b = b + start_code_token_id
+                intervals.append((abs_a, abs_b, b - a, c))  # (start, end, span_len, concept)
 
-    # If no spans, return all -1
     if not intervals:
         return mat.tolist()
 
-    # 2) Sort intervals by start
+    # 2) Sort by start char
     intervals.sort(key=lambda x: x[0])
-    # print(len(intervals))
     j = 0
-    active = []  # list of (end_char, concept_id)
+    active = []  # list of (end_char, span_len, concept_id)
 
     global trainer_flag_1
     # 3) Single pass over tokens
     for tok_idx, (tok_s, tok_e) in enumerate(offsets):
         if tok_s == tok_e:
-            continue  # skip empty offsets
+            continue
 
-        # Add all intervals that start before token ends
+        # Add intervals whose start < tok_e
         while j < len(intervals) and intervals[j][0] < tok_e:
-            _, end_c, c = intervals[j]
-            active.append((end_c, c))
+            _, end_c, span_len, c = intervals[j]
+            active.append((end_c, span_len, c))
             j += 1
 
-        # Remove intervals that ended before or at token start
+        # Drop intervals that ended at or before tok_s
         if active:
-            active = [(end_c, c) for (end_c, c) in active if end_c > tok_s]
+            active = [(end_c, sl, c) for (end_c, sl, c) in active if end_c > tok_s]
 
-        # Determine which concepts overlap this token:
-        # (Since we only keep end>tok_s and added with start<tok_e, overlap holds)
-        # print("active:", len(active))
         if active:
-            # switch from -1s to 0s (one-hot base)
-            mat[tok_idx, :] = 0
-            # If you truly want strictly one-hot and a token can belong to only ONE concept,
-            # replace this loop by choosing one concept (e.g., first).
-            for _, c in active:
-                mat[tok_idx, c] = 1
-            
+            mat[tok_idx, :] = 0  # mark as "in code region"
+            # For each concept, store the MINIMUM overlapping span length
+            # (minimum = most specific / closest enclosing construct)
+            for _, span_len, c in active:
+                cur = mat[tok_idx, c]
+                if cur == 0 or span_len < cur:
+                    mat[tok_idx, c] = max(span_len, 1)  # keep >= 1 to distinguish from "not active"
+
             if not trainer_flag_1:
                 print(tokens[tok_idx])
     trainer_flag_1 = True
-        
+
     return mat.tolist()
 
 
@@ -304,6 +304,12 @@ def build_tokenized_example(example, tokenizer, max_length, reasoning_weight=1.0
         start_code_token_id=code_start,
     )
 
+    # 1 for tokens whose char span overlaps the code region, 0 otherwise
+    code_mask = [
+        1 if tok_e > code_start and tok_s < code_end else 0
+        for tok_s, tok_e in offsets
+    ]
+
     return {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
@@ -311,7 +317,7 @@ def build_tokenized_example(example, tokenizer, max_length, reasoning_weight=1.0
         "assistant_mask": assistant_mask,
         "concept_mat": concept_mat,
         "loss_weights": loss_weights,
-        # "code_mask": code_mask,
+        "code_mask": code_mask,
     }
 
 
@@ -330,7 +336,7 @@ def build_supervised_collator(tokenizer):
             "assistant_mask": [],
             "concept_mat": [],
             "loss_weights": [],
-            # "code_mask": [],
+            "code_mask": [],
         }
 
         for feature in features:
@@ -341,14 +347,15 @@ def build_supervised_collator(tokenizer):
             batch["assistant_mask"].append(feature["assistant_mask"] + [0] * pad_len)
             batch["concept_mat"].append(feature["concept_mat"] + [[-1] * len(concept_mapping)] * pad_len)
             batch["loss_weights"].append(feature["loss_weights"] + [0.0] * pad_len)
-            # batch["code_mask"].append(feature["code_mask"] + [0] * pad_len)
+            batch["code_mask"].append(feature["code_mask"] + [0] * pad_len)
 
         batch_out = {"input_ids": torch.tensor(batch["input_ids"], dtype=torch.long),
                      "attention_mask": torch.tensor(batch["attention_mask"], dtype=torch.long),
                      "labels": torch.tensor(batch["labels"], dtype=torch.long),
                      "assistant_mask": torch.tensor(batch["assistant_mask"], dtype=torch.long),
                      "concept_mat": torch.tensor(batch["concept_mat"], dtype=torch.long),
-                     "loss_weights": torch.tensor(batch["loss_weights"], dtype=torch.float)}
+                     "loss_weights": torch.tensor(batch["loss_weights"], dtype=torch.float),
+                     "code_mask": torch.tensor(batch["code_mask"], dtype=torch.bool)}
         return batch_out
 
     return collate_fn
@@ -357,8 +364,9 @@ def build_supervised_collator(tokenizer):
 def split_batch_for_model(batch):
     aux = {
         "assistant_mask": batch.pop("assistant_mask", None),
-        "loss_weights": batch.pop("loss_weights", None),
-        "concept_mat": batch.pop("concept_mat", None),
+        "loss_weights":   batch.pop("loss_weights",   None),
+        "concept_mat":    batch.pop("concept_mat",    None),
+        "code_mask":      batch.pop("code_mask",      None),
     }
     return batch, aux
 
@@ -638,6 +646,7 @@ def train(model, train_loader, optimizer, lr_scheduler, accelerator, args, eval_
                     **batch,
                     loss_weights=aux["loss_weights"],
                     concept_mat=aux["concept_mat"],
+                    code_mask=aux["code_mask"],
                 )
                 loss = outputs.loss
                 accelerator.backward(loss)
@@ -1016,7 +1025,7 @@ def main():
         if model.converted_layer_indices:
             print(
                 "Converted MLP->MoE layers: "
-                f"{model.converted_layer_indices} | num_experts_temp={model.num_experts_temp} | top_k={model.moe_top_k}"
+                f"{model.converted_layer_indices} | num_nl_experts={model.num_nl_experts} | top_k_nl={model.top_k_nl}"
             )
         else:
             print("No MoE conversion requested. Using the original dense model.")
