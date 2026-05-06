@@ -45,7 +45,8 @@ the given input in [ ANSWER ] and [/ ANSWER ] tags .
 assert {input} == ??
 [/PYTHON]
 <think>
-Let's execute the code step by step:
+
+### Understanding the Function
 """
 
 def make_direct_output_prompt(s):

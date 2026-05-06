@@ -1,6 +1,8 @@
 #!/bin/bash
 
-project="qwen3-4B-semcoder-thinking_mode_on-e_16-layer_33_34_-all_layers-assistant_only-k_1-reasoning_0.5_content_1.0-dpo"
+# project="qwen3-4B-semcoder-thinking_mode_on-e_16-layer_33_34_-all_layers-assistant_only-k_1-reasoning_0.5_content_1.0-dpo-v2"
+project="qwen3-4B-semcoder-thinking_mode_on-e_16-layer_33_34_-all_layers-assistant_only-k_1-dpo-v2"
+
 model_dir="../../../data/saved_models/${project}/"
 # project="qwen3-4B-test-e_24-layer_33_34_-k_1-all_tokens_test"
 # model_dir="../../../data/saved_models/${project}/"

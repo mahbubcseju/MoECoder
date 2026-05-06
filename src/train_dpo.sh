@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-sft_project="qwen3-4B-semcoder-thinking_mode_on-e_16-layer_33_34_-all_layers-assistant_only-k_1-reasoning_0.5_content_1.0"
+sft_project="qwen3-4B-semcoder-thinking_mode_on-e_16-layer_33_34_-all_layers-assistant_only-k_1"
 dpo_project="${sft_project}-dpo-v2"
 
 sft_model_dir="../data/saved_models/${sft_project}/"

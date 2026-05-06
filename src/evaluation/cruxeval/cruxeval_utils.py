@@ -289,7 +289,7 @@ class OutputPrediction(Task):
         # cot and monologue cannot be both true
         assert not (self.cot and self.monologue), "cot and monologue cannot be both true"
         if self.cot:
-            return make_cot_output_prompt_w_think((doc["code"], doc["input"]))
+            return make_cot_output_prompt((doc["code"], doc["input"]))
         elif self.monologue:
             return make_forward_monologue_output_prompt((doc["code"], doc["input"]))
         else:
