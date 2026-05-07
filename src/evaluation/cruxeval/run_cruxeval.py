@@ -1,5 +1,5 @@
 # Reference: https://github.com/facebookresearch/cruxeval/blob/main/inference/main.py
-import sys 
+import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parents[2]))  # .../MoECoder/src
 print(sys.path)
@@ -8,11 +8,12 @@ import json
 import random
 import fnmatch
 
+import torch
 import datasets
 import numpy as np
 import transformers
-from vllm import LLM
 from transformers import HfArgumentParser, AutoTokenizer
+from model import MoECausalLM
 
 from evaluation.cruxeval.cruxeval_utils import Generator, EvalArguments, ALL_TASKS
 
@@ -152,6 +153,12 @@ def parse_args():
         default="references.json",
         help="Path for saving the reference solutions/tests",
     )
+    parser.add_argument(
+        "--dataset_path",
+        type=str,
+        default=None,
+        help="Path to a local JSONL file to use instead of downloading from HuggingFace hub.",
+    )
     args = parser.parse_args()
 
     precision_map = {
@@ -189,14 +196,21 @@ def main():
     transformers.logging.set_verbosity_error()
     datasets.logging.set_verbosity_error()
 
-    model = LLM(
-        model=args.model, 
-        dtype=args.precision, 
-        trust_remote_code=args.trust_remote_code, 
-        gpu_memory_utilization=0.90,
-        tensor_parallel_size=args.tensor_parallel_size,
-        max_model_len=4096,
+    dtype_map = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
+    model = MoECausalLM.from_pretrained(
+        args.model,
+        trust_remote_code=args.trust_remote_code,
+        torch_dtype=dtype_map[args.precision],
     )
+    model = model.cuda()
+    model.config.use_cache = True  # was disabled during training; re-enable for KV-cache inference
+    model.eval()
+
+    # Verify all parameters are on GPU
+    devices = {p.device for p in model.parameters()}
+    print(f"Model parameter devices: {devices}")
+    assert all(d.type == "cuda" for d in devices), f"Some parameters are NOT on GPU: {devices}"
+    print(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model,

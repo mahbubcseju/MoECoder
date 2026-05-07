@@ -15,13 +15,14 @@ set -euo pipefail
 # project="Qwen3-4B-thing-lets-step-by-step"
 # project="qwen3-4B-semcoder-thinking_mode_on-e_16-layer_33_34_-all_layers-assistant_only-k_1"
 # project="qwen3-4B-semcoder-thinking_mode_on-e_16-layer_33_34_-all_layers-assistant_only-k_1-reasoning_0.5_content_1.0"
-project="qwen3-4B-semcoder-thinking_mode_on-e_16-layer_33_34_-all_layers-assistant_only-k_1-reasoning_0.5_content_1.0-dpo"
+# project="qwen3-4B-semcoder-thinking_mode_on-e_16-layer_33_34_-all_layers-assistant_only-k_1-reasoning_0.5_content_1.0-dpo"
+project="qwen3-4B-semcoder-thinking_mode_on-code_e_15-nl_e_4-layer_33_34_-k_nl_1"
 
 cot=true
 model_dir="../../../data/saved_models/${project}/"
 # model_dir="Qwen/Qwen3-4B"
 
 
-bash generate.sh ${project} ${cot} ${model_dir}
+# bash generate.sh ${project} ${cot} ${model_dir}
 bash process.sh ${project} ${cot}
 bash eval.sh ${project} ${cot}

@@ -94,6 +94,7 @@ class MoEMLP(nn.Module):
 
         if concept_mat is not None and code_mask is not None:
             # --- Code experts (concept-driven deterministic routing) ---
+            # print("Concept mask", hidden_states.shape)
             cm      = concept_mat.to(hidden_states.device)   # [B, T, C]
             cm_code = code_mask.to(hidden_states.device)     # [B, T] bool
 
@@ -136,6 +137,7 @@ class MoEMLP(nn.Module):
             output = code_output + nl_output
             self.last_aux_loss = self._compute_nl_aux_loss(nl_logits, topk_idx, ~cm_code)
         else:
+            # print("No concept mask available", hidden_states.shape)
             # Fallback: no routing info available (DPO, inference) → all tokens use NL experts
             output = nl_output
             self.last_aux_loss = self._compute_nl_aux_loss(nl_logits, topk_idx, None)
@@ -326,18 +328,23 @@ class MoECausalLM(Qwen3ForCausalLM):
             print("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^")
 
             if getattr(config, "moe_layer_indices", []):
+                num_concepts   = getattr(config, "num_concepts",           14)
+                num_nl_experts = getattr(config, "num_nl_experts",          4)
+                top_k_nl       = getattr(config, "top_k_nl",                1)
+                top_k_code     = getattr(config, "top_k_code",    num_concepts)
+                aux_weight     = getattr(config, "router_aux_loss_weight", 0.01)
                 model._replace_mlp_with_moe(
                     config.moe_layer_indices,
-                    config.num_concepts,
-                    config.num_nl_experts,
-                    config.top_k_nl,
-                    config.top_k_code,
+                    num_concepts,
+                    num_nl_experts,
+                    top_k_nl,
+                    top_k_code,
                 )
-                model.router_aux_loss_weight = config.router_aux_loss_weight
-                model.top_k_nl               = config.top_k_nl
-                model.top_k_code             = config.top_k_code
-                model.num_nl_experts         = config.num_nl_experts
-                model.num_concepts           = config.num_concepts
+                model.router_aux_loss_weight = aux_weight
+                model.top_k_nl               = top_k_nl
+                model.top_k_code             = top_k_code
+                model.num_nl_experts         = num_nl_experts
+                model.num_concepts           = num_concepts
 
                 if saved_meta is not None:
                     torch_dtype = kwargs.get("torch_dtype", None)
@@ -389,9 +396,19 @@ class MoECausalLM(Qwen3ForCausalLM):
 
     def forward(self, *args, loss_weights=None, concept_mat=None, code_mask=None,
                 skip_moe_losses=False, **kwargs):
+        # During decode steps (KV cache active, processing 1 new generated token),
+        # concept routing is not applicable — generated tokens have no annotations.
+        # Only use concept routing during prefill (processing the full prompt).
+        past_kv   = kwargs.get("past_key_values")
+        input_ids = kwargs.get("input_ids", args[0] if args else None)
+        is_decode_step = (past_kv is not None
+                          and input_ids is not None
+                          and input_ids.shape[1] == 1)
+        use_concept = not skip_moe_losses and not is_decode_step
+        # print(use_concept, concept_mat)
         for layer in self.moe_layers:
-            setattr(layer, "concept_mat", None if skip_moe_losses else concept_mat)
-            setattr(layer, "code_mask",   None if skip_moe_losses else code_mask)
+            setattr(layer, "concept_mat", concept_mat if use_concept else None)
+            setattr(layer, "code_mask",   code_mask   if use_concept else None)
 
         outputs = super().forward(*args, **kwargs)
 

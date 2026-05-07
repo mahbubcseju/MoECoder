@@ -26,7 +26,9 @@ def main():
     final_result = {}
     for key in generations.keys():
         # print(key, generations[key])
-        final_result[f"sample_{key}"] = generations[key]
+        # print(type(generations[key]), generations[key])
+        final_result[f"sample_{key}"] = [x.replace("\n[/ANSWER]", "") for x in generations[key]]
+        print(final_result[f"sample_{key}"])
 
     with open(output_path, "w") as f:
         json.dump(final_result, f, indent=2)

@@ -4,7 +4,7 @@
 
 project="$1"
 cot="$2"
-model_dir="$3"
+model_dir="$3" # optional: path to local JSONL (e.g. cruxeval_concepts.jsonl)
 
 echo "Project: ${project}"
 echo "CoT: ${cot}"
@@ -26,6 +26,7 @@ mkdir -p ${output_dir}/
 mkdir -p ${log_dir}/
 python run_cruxeval.py \
     --model  ${model_dir} \
+    --dataset_path ../../../data/cruxeval/cruxeval_concepts.jsonl \
     --use_auth_token \
     --trust_remote_code \
     --tasks output_prediction \

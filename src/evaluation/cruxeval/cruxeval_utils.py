@@ -2,7 +2,7 @@
 
 from math import ceil
 import numpy as np
-from vllm import SamplingParams
+import torch
 from torch.utils.data import DataLoader
 import json
 from abc import ABC, abstractmethod
@@ -16,9 +16,20 @@ from torch.utils.data import IterableDataset
 from tqdm import tqdm
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List
+
+
+@dataclass
+class HFSamplingParams:
+    n: int = 1
+    temperature: float = 0.2
+    top_p: float = 0.95
+    top_k: int = -1
+    max_tokens: int = 1024
+    stop: List[str] = field(default_factory=list)
 
 from evaluation.cruxeval.cruxeval_prompts import *
+from train import build_concept_matrix_tokencentric, concept_mapping
 
 
 @dataclass
@@ -130,33 +141,50 @@ class Task(ABC):
     # The name of a subset within `DATASET_PATH`.
     DATASET_NAME: str = None
 
-    def __init__(self, stop_words=None, requires_execution=True):
+    def __init__(self, stop_words=None, requires_execution=True, dataset_path=None):
         """
         :param stop_words: list
             list of stop words if the generation uses a stopping criteria during generation
         :param requires_execution: bool
             wheter the task requires code execution during evaluation or not
+        :param dataset_path: str or None
+            path to a local JSONL file; if provided, skips HuggingFace hub download
         """
         self.stop_words = stop_words
         self.requires_execution = requires_execution
-        try:
-            self.dataset = load_dataset(path=self.DATASET_PATH, name=self.DATASET_NAME)
-        except:
-            with open(self.DATASET_PATH, "r") as f:
-                lines = f.readlines()
-            lines_json = [json.loads(i) for i in lines]
-            data = {}
-            columns = ["code", "input", "output", "id"]
-            for k in columns:
-                data[k] = []
-            for l in lines_json:
+        if dataset_path is not None:
+            with open(dataset_path, "r") as f:
+                rows = [json.loads(line) for line in f if line.strip()]
+            for row in rows:
+                # normalise field name: cruxeval JSONL uses "refcode", HF hub uses "code"
+                if "refcode" in row and "code" not in row:
+                    row["code"] = row.pop("refcode")
+                # serialise concepts dict to JSON string to avoid HF schema inference
+                # issues with nested list-of-lists; parsed back in complete_code()
+                row["concepts_json"] = json.dumps(row.pop("concepts", {}))
+                row.setdefault("id", "")
+                # print(row["concepts_json"])
+            split = Dataset.from_list(rows)
+            self.dataset = {"test": split}
+        else:
+            try:
+                self.dataset = load_dataset(path=self.DATASET_PATH, name=self.DATASET_NAME)
+            except:
+                with open(self.DATASET_PATH, "r") as f:
+                    lines = f.readlines()
+                lines_json = [json.loads(i) for i in lines]
+                data = {}
+                columns = ["code", "input", "output", "id"]
                 for k in columns:
-                    data[k].append(l[k])
-            data = Dataset.from_dict(data)
-            self.dataset = data
-            warn(
-                "This task will use a locally downloaded dataset, not from the HF hub."
-            )
+                    data[k] = []
+                for l in lines_json:
+                    for k in columns:
+                        data[k].append(l[k])
+                data = Dataset.from_dict(data)
+                self.dataset = {"test": data}
+                warn(
+                    "This task will use a locally downloaded dataset, not from the HF hub."
+                )
 
     @abstractmethod
     def get_dataset(self):
@@ -215,12 +243,13 @@ class InputPrediction(Task):
     DATASET_PATH = "cruxeval-org/cruxeval"
     DATASET_NAME = None
 
-    def __init__(self, cot = False, monologue = False):
+    def __init__(self, cot=False, monologue=False, dataset_path=None):
         self.cot = cot
         self.monologue = monologue
         super().__init__(
             stop_words=["[/ANSWER]"],
             requires_execution=False,
+            dataset_path=dataset_path,
         )
 
     def get_dataset(self):
@@ -268,14 +297,13 @@ class OutputPrediction(Task):
     DATASET_PATH = "cruxeval-org/cruxeval"
     DATASET_NAME = None
 
-    def __init__(self, cot = False, monologue = False):
+    def __init__(self, cot=False, monologue=False, dataset_path=None):
         self.cot = cot
         self.monologue = monologue
-        stop_words = ["[/ANSWER]"]
-
         super().__init__(
-            stop_words=stop_words,
+            stop_words=["[/ANSWER]"],
             requires_execution=False,
+            dataset_path=dataset_path,
         )
 
     def get_dataset(self):
@@ -321,19 +349,19 @@ TASK_REGISTRY = {
 ALL_TASKS = sorted(list(TASK_REGISTRY))
 
 
-def get_task(task_name, cot = False, monologue = False):
+def get_task(task_name, cot=False, monologue=False, dataset_path=None):
     try:
-        return TASK_REGISTRY[task_name](cot = cot, monologue = monologue)
+        return TASK_REGISTRY[task_name](cot=cot, monologue=monologue, dataset_path=dataset_path)
     except KeyError:
         print("Available tasks:")
         pprint(TASK_REGISTRY)
         raise KeyError(f"Missing task {task_name}")
 
 
-from vllm.inputs import TokensPrompt
 def complete_code(
     task,
     model,
+    tokenizer,
     sampling_params,
     dataloader,
     batch_size,
@@ -346,49 +374,105 @@ def complete_code(
     code_gens = defaultdict(list)
     code_gens_raw = defaultdict(list)
     total = math.ceil(n_tasks * dataloader.dataset.n_copies)
-    # TODO: check the batch > 1 case
+
+    device = next(model.parameters()).device
+    # Build row_index → row mapping once.
+    # We cannot use row_index as a positional index because --shuffle reorders the dataset,
+    # so position i no longer corresponds to row_index value i.
+    current_dataset = dataloader.dataset.dataset
+    row_lookup = {
+        current_dataset[i]["row_index"]: current_dataset[i]
+        for i in range(len(current_dataset))
+    }
+
     with open(log_path, "w") as f:
         for step, batch in tqdm(enumerate(dataloader), total=total):
-            inputs = batch["ids"][:, : batch["input_len"]].tolist()
-            num_tokens = len(inputs[0])
-            if max_length_generation - num_tokens < 0:
+            input_len = int(batch["input_len"][0].item())
+            input_ids = batch["ids"][:, :input_len].to(device)   # [1, input_len]
+            attention_mask = torch.ones_like(input_ids)
+
+            max_new_tokens = max_length_generation - input_len
+            if max_new_tokens <= 0:
                 code_gens[int(batch["row_index"][0])].extend([""] * batch_size)
                 code_gens_raw[int(batch["row_index"][0])].extend([""] * batch_size)
                 warnings.warn(
-                    f"Skipping task {batch['row_index'][0]} because it is too long -- [{max_length_generation=}|{num_tokens=}]"
+                    f"Skipping task {batch['row_index'][0]} because it is too long"
+                    f" [{max_length_generation=}|{input_len=}]"
                 )
                 continue
-            sampling_params.max_tokens = max_length_generation - num_tokens
-            # outputs = model.generate(
-            #     prompt_token_ids=inputs, sampling_params=sampling_params, use_tqdm=False
-            # )
 
-            # generated_tasks = batch["row_index"].repeat(batch_size)
-            # generated_texts = [o.text for o in outputs[0].outputs]
+            # Build concept_mat and code_mask for the prompt (prefill phase).
+            concept_mat = None
+            code_mask   = None
+            row_idx  = int(batch["row_index"][0].item())
+            doc      = row_lookup[row_idx]
+            # Apply same quote normalisation that TokenizedDataset applies before get_prompt()
+            code     = doc.get("code", "").replace("'", '"')
+            concepts_dict = json.loads(doc.get("concepts_json", "{}"))
+            prompt_str = batch["prompt"][0]
+            if code and concepts_dict and code in prompt_str:
+                code_start = prompt_str.index(code)
+                code_end   = code_start + len(code)
+                enc = tokenizer(
+                    prompt_str,
+                    truncation=True,
+                    max_length=max_length_generation,
+                    return_offsets_mapping=True,
+                )
+                offsets  = enc["offset_mapping"]
+                ids_list = enc["input_ids"]
+                mat = build_concept_matrix_tokencentric(
+                    example={"concepts": concepts_dict},
+                    input_ids=ids_list,
+                    tokens=tokenizer.convert_ids_to_tokens(ids_list),
+                    offsets=offsets,
+                    concept_mapping=concept_mapping,
+                    start_code_token_id=code_start,
+                )
+                mask_list = [
+                    1 if tok_e > code_start and tok_s < code_end else 0
+                    for tok_s, tok_e in offsets
+                ]
+                concept_mat = torch.tensor([mat],       dtype=torch.long, device=device)
+                code_mask   = torch.tensor([mask_list], dtype=torch.bool, device=device)
 
-            # ✅ vLLM wants prompt objects (or strings), not prompt_token_ids=...
-            prompts = [TokensPrompt(prompt_token_ids=ids) for ids in inputs]
-            outputs = model.generate(prompts, sampling_params=sampling_params, use_tqdm=False)
+            do_sample = sampling_params.temperature > 0
+            gen_kwargs = dict(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                num_return_sequences=batch_size,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                concept_mat=concept_mat,
+                code_mask=code_mask,
+            )
+            if do_sample:
+                gen_kwargs["temperature"] = sampling_params.temperature
+                gen_kwargs["top_p"] = sampling_params.top_p
+                if sampling_params.top_k > 0:
+                    gen_kwargs["top_k"] = sampling_params.top_k
+            if sampling_params.stop:
+                gen_kwargs["stop_strings"] = sampling_params.stop
+                gen_kwargs["tokenizer"] = tokenizer
 
-            generated_tasks = batch["row_index"].repeat(batch_size)
+            with torch.no_grad():
+                output_ids = model.generate(**gen_kwargs)  # [batch_size, total_len]
 
-            # ✅ one output per prompt; take the top completion
-            generated_texts = [out.outputs[0].text for out in outputs]
-
-            
-            combined_texts = [
-                batch["prompt"][0] + generated_text for generated_text in generated_texts
+            generated_texts = [
+                tokenizer.decode(output_ids[i, input_len:], skip_special_tokens=True)
+                for i in range(output_ids.shape[0])
             ]
 
-            # write the logs of raw generations
+            generated_tasks = batch["row_index"].repeat(batch_size)
+            combined_texts = [batch["prompt"][0] + text for text in generated_texts]
+
             for task_idx, text in zip(generated_tasks, generated_texts):
-                d = {}
                 task_idx = int(task_idx.item())
-                d["task_idx"] = task_idx
-                d["prompt"] = batch["prompt"][0]
-                d["response"] = text
-                f.write(json.dumps(d) + "\n")
+                f.write(json.dumps({"task_idx": task_idx, "prompt": batch["prompt"][0], "response": text}) + "\n")
                 f.flush()
+
             flag = 0
             for task_idx, text in zip(generated_tasks, combined_texts):
                 if flag == 0:
@@ -411,7 +495,8 @@ class Generator:
         self.args = args
 
     def generate(self, task_name, log_path):
-        task = get_task(task_name, cot = self.args.cot, monologue = self.args.monologue)
+        task = get_task(task_name, cot=self.args.cot, monologue=self.args.monologue,
+                        dataset_path=getattr(self.args, "dataset_path", None))
 
         dataset = task.get_dataset()
 
@@ -443,7 +528,7 @@ class Generator:
             prefix=self.args.prefix,
         )
 
-        sampling_params = SamplingParams(
+        sampling_params = HFSamplingParams(
             n=self.args.batch_size,
             temperature=self.args.temperature,
             top_p=self.args.top_p,
@@ -455,7 +540,7 @@ class Generator:
         ds_loader = DataLoader(ds_tokenized, batch_size=1)
 
         generations, generations_raw = complete_code(
-            task, self.model, sampling_params, ds_loader, self.args.batch_size, n_tasks, log_path
+            task, self.model, self.tokenizer, sampling_params, ds_loader, self.args.batch_size, n_tasks, log_path
         )
 
         references = [task.get_reference(dataset[i]) for i in range(n_tasks)]
